@@ -192,6 +192,27 @@ cgnat_path_link_up (cgnat_path_t *p)
 	 vnet_sw_interface_is_link_up (vnet_get_main (), rd->rd_sw_if_index);
 }
 
+/* is every interface we translate on up with link?  A node that can't
+   forward must not hold subscribers: at startup a VF's link comes up
+   seconds after the pair link, and a lost uplink should hand over */
+static int
+cgnat_data_links_up (void)
+{
+  cgnat_main_t *cm = &cgnat_main;
+  vnet_main_t *vnm = vnet_get_main ();
+  uword *ifs[] = { cm->inside_ifs, cm->outside_ifs };
+  u32 i, sw_if_index;
+
+  for (i = 0; i < ARRAY_LEN (ifs); i++)
+    clib_bitmap_foreach (sw_if_index, ifs[i])
+      {
+	if (vnet_get_sw_interface_or_null (vnm, sw_if_index) &&
+	    !vnet_sw_interface_is_up (vnm, sw_if_index))
+	  return 0;
+      }
+  return 1;
+}
+
 /* evaluate liveness and readiness; runs on main each hello interval */
 static void
 cgnat_cluster_evaluate (vlib_main_t *vm, f64 now)
@@ -281,6 +302,18 @@ cgnat_cluster_evaluate (vlib_main_t *vm, f64 now)
     {
       cl->reason = CGNAT_REASON_STARTING;
       cl->ready = 0;
+    }
+  else if (!cgnat_data_links_up ())
+    {
+      /* can't forward: the peer serves everyone; once we can again we
+	 pull its table before taking subscribers back */
+      cl->reason = CGNAT_REASON_INTERFACE_DOWN;
+      cl->ready = 0;
+      cl->incumbent = 0;
+      cl->resync_done = 0;
+      cl->resync_end_mask = 0;
+      cl->resync_end_needed = 0;
+      cl->resync_req_sent_at = 0;
     }
   else if (pool_elts (cgnat_main.maps) == 0)
     {

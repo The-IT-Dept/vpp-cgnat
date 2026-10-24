@@ -219,7 +219,8 @@ while ready.
 
 | reason | ready | meaning |
 |---|---|---|
-| `starting` | no | First dead interval after the pair-link address exists. Can't hear the peer yet. |
+| `starting` | no | The pair-link address isn't on an interface with link yet, or it is but the peer hasn't been heard on it for long (until it is heard, or for a dead interval plus 1.5 s). Can't tell yet whether the node is alone. |
+| `interface-down` | no | An interface with translation enabled (inside or outside) is admin-down or has no link: the node can't forward, so the peer serves everyone. When the link returns the node resyncs before taking subscribers back, as when joining. |
 | `unconfigured` | no | No maps: nothing to translate. |
 | `alone` | yes | Peer silent on every path. This node owns everyone. |
 | `none` | yes | Pair up, owners split. |

@@ -31,6 +31,7 @@ typedef struct
   _ (RESYNCING, "resyncing")                                                  \
   _ (CONFIG_MISMATCH, "config-mismatch")                                      \
   _ (FENCED, "fenced")                                                        \
+  _ (INTERFACE_DOWN, "interface-down")                                        \
   _ (DUPLICATE, "duplicate-node-id")
 
 typedef enum

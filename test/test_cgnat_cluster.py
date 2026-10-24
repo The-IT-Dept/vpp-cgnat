@@ -319,6 +319,28 @@ class TestCgnatClusterHello(CgnatClusterCase):
             self.cluster_on()
             self.vapi.bond_delete(sw_if_index=bond)
 
+    def test_not_ready_until_data_interfaces_have_link(self):
+        """A translating interface without link (a VF still coming up, a memberless
+        bond): not ready, whatever the pair link says; ready once it's gone"""
+        r = self.vapi.bond_create2(mode=3, lb=1, numa_only=False, enable_gso=False,
+                                   use_custom_mac=False, mac_address="00:00:00:00:00:00",
+                                   id=78)
+        bond = r.sw_if_index
+        self.vapi.sw_interface_set_flags(bond, flags=1)
+        self.vapi.cgnat_interface_add_del_feature(is_add=1, is_inside=0,
+                                                  sw_if_index=bond)
+        try:
+            self.cluster_on()
+            self.sleep(2.5)  # past the start hold
+            st = self.status()
+            self.assertEqual((st.ready, st.reason), (False, "interface-down"))
+        finally:
+            self.vapi.cgnat_interface_add_del_feature(is_add=0, is_inside=0,
+                                                      sw_if_index=bond)
+            self.vapi.bond_delete(sw_if_index=bond)
+        self.assertTrue(self.wait_for(lambda: self.status().ready))
+        self.assertEqual(self.status().reason, "alone")
+
     def test_peer_heard_late_still_joins(self):
         """A ready peer first heard 0.7 s after start (link/ARP warm-up): we join and
         resync, we don't declare ourselves alone and skip the resync"""
@@ -408,6 +430,26 @@ class TestCgnatClusterOwner(CgnatOwnerCase):
         self.assertFalse(st.pair_alive)
         self.assertEqual((st.fenced, st.ready), (False, True))
         self.assertEqual(self.owners(), {1: 256})
+
+    def test_interface_down_hands_over(self):
+        """Serving, then our outside interface goes down: we step down and the peer
+        owns everyone; back up, we resync before taking subscribers again"""
+        self.keep_hello(0.5)
+        self.assertEqual(set(self.owners()), {1, 2})
+        self.pg1.admin_down()
+        try:
+            self.keep_hello(0.3)
+            st = self.status()
+            self.assertEqual((st.ready, st.reason), (False, "interface-down"))
+            self.assertEqual(self.owners(), {2: 256})
+        finally:
+            self.pg1.admin_up()
+        self.pg2.enable_capture()
+        self.keep_hello(0.5)
+        st = self.status()
+        self.assertEqual((st.ready, st.reason), (False, "resyncing"))
+        self.assertTrue(self.capture_msgs(self.pg2, RESYNC_REQ))
+        self.assertEqual(self.owners(), {2: 256})
 
     def test_mismatch_freezes_ownership(self):
         """Config mismatch: not ready, ownership stays as last agreed"""
