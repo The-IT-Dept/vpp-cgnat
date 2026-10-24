@@ -128,7 +128,19 @@ from 4096 subscribers × 63 flows through a test map:
 - **Where it stops:** the bottleneck is the host's vhost-net/OVS kernel path, not VPP. Every drop was a DPDK virtio TX failure on the output NIC, with no `rx-miss` on input.
 - **VPP's headroom:** the CGNAT workers ran at about 1,100–1,500 clocks per packet with vectors far from full. The translation itself has several times that headroom on these two workers.
 - **What 280 kpps lossless means:** roughly 2 Gb/s of typical traffic at an average of about 900 bytes per packet.
-- **Going faster:** for line rate, give the VMs SR-IOV VFs (or OVS-DPDK/vhost-user) instead of vhost-net.
+
+**DPDK against the kernel path, measured on both production nodes.** Same
+generator and test. The test NICs were either bound to DPDK, or left to the
+guest kernel (virtio-net) and attached to VPP with `af_packet`:
+
+| node, I/O | lossless up to | best forwarded | at about 1 Mpps offered |
+|---|---|---|---|
+| cgnat-2, DPDK virtio | 280 kpps | 426 kpps | n/a |
+| cgnat-1, DPDK virtio | 255 kpps | 477 kpps | 411 kpps |
+| cgnat-1, af_packet (kernel virtio-net) | 130 kpps | 172 kpps | 99 kpps (collapses) |
+
+- **DPDK is the right choice in the VM:** about 2–3× the kernel path, and it degrades gracefully instead of collapsing.
+- **The next step up is the host side:** SR-IOV VFs, or OVS-DPDK with vhost-user. Not tested: that's a host NIC/OVS change on a hypervisor that carries everything else.
 
 ## Performance (single node, packet generator)
 
