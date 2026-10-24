@@ -98,6 +98,34 @@ sessions. Neither has per-subscriber port blocks except det44's static ones.
 - **Multi-worker correct.** It must be correct with several VPP worker threads, including
   packet handoff between workers. nat44-ei's port allocators got this wrong.
 
+## Rulings (after the builder check)
+
+- **Split-brain.** Liveness is checked on several paths: the pair link, plus the inside
+  and outside networks. The two VMs share one switch fabric, so the pair link isn't
+  independent.
+  - A node takes over a peer's subscribers only if that peer is unreachable on all paths.
+  - If only the pair link is down and the peer is visibly alive elsewhere, the
+    higher-ID node fences itself: it drops "ready" and stops translating. It never
+    double-allocates.
+  - When the link returns: full resync, then both ready.
+  - (Nick: "same fabric, just a second server". These are my calls; a redundant pair
+    link can be added later.)
+- **Config agreement.** Each node puts a hash of its maps and cluster config into every
+  heartbeat and sync message.
+  - On a mismatch, both keep running on the last config they agreed on, drop "ready",
+    and say why.
+  - Removing a map flushes its sessions. Changing a map that has live sessions is
+    refused (remove and re-add instead).
+- **Subscriber identity** is (inside VRF, inside address) from day one, so maps in
+  different inside VRFs may overlap. This applies to session keys, ownership, steering
+  metadata, the API and lookups.
+- **Cut-over from cgnat-1** keeps the mappings, not live sessions. The only CGNAT
+  subscriber is the test line.
+- **Design target** (an order of magnitude for sizing tables and sync; measured numbers
+  come from testing): about 10k subscribers, 1M concurrent sessions, 50k new sessions per
+  second and 10 Gbps per pair. With any-hash ECMP, about half of all traffic crosses the
+  pair link, so plan link capacity for that.
+
 ## Constraints
 
 - VPP 26.06, in C.
