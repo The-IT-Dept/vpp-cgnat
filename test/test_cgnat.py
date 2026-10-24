@@ -5,7 +5,7 @@
 import ipaddress
 import unittest
 
-from scapy.layers.inet import ICMP, IP, TCP, UDP, IPerror, UDPerror, fragment
+from scapy.layers.inet import ICMP, IP, TCP, UDP, IPerror, IPOption_RR, UDPerror, fragment
 from scapy.layers.l2 import Ether
 from scapy.packet import Raw
 
@@ -131,13 +131,13 @@ class TestCgnatMap(VppTestCase):
 
 
 class CgnatPgCase(VppTestCase):
-    """Shared topology: pg0 inside (VRF 1), pg1 outside (VRF 0).
+    """Shared topology: pg0 inside, pg1 outside, one table (the default).
 
-    Map: pg0's subnet 172.16.1.0/24 (inside VRF 1) -> 192.0.2.0/30 (VRF 0),
-    ratio 64, 1008 ports per subscriber.
+    Map: pg0's subnet 172.16.1.0/24 -> 192.0.2.0/30, ratio 64, 1008 ports
+    per subscriber.  Subclasses may set in_vrf to put pg0 in its own table.
     """
 
-    in_vrf = 1
+    in_vrf = 0
     pool = "192.0.2.0"
     pool_plen = 30
     n_inside_hosts = 4
@@ -146,9 +146,10 @@ class CgnatPgCase(VppTestCase):
     def setUpClass(cls):
         super().setUpClass()
         cls.create_pg_interfaces(range(2))
-        # class-lifetime table: kept out of the per-test object registry
-        cls.vapi.ip_table_add_del_v2(is_add=1, table={"table_id": cls.in_vrf})
-        cls.pg0.set_table_ip4(cls.in_vrf)
+        if cls.in_vrf:
+            # class-lifetime table: kept out of the per-test object registry
+            cls.vapi.ip_table_add_del_v2(is_add=1, table={"table_id": cls.in_vrf})
+            cls.pg0.set_table_ip4(cls.in_vrf)
         for i in cls.pg_interfaces:
             i.admin_up()
             i.config_ip4()
@@ -164,7 +165,8 @@ class CgnatPgCase(VppTestCase):
             i.unconfig_ip4()
             i.set_table_ip4(0)
             i.admin_down()
-        cls.vapi.ip_table_add_del_v2(is_add=0, table={"table_id": cls.in_vrf})
+        if cls.in_vrf:
+            cls.vapi.ip_table_add_del_v2(is_add=0, table={"table_id": cls.in_vrf})
         super().tearDownClass()
 
     def setUp(self):
@@ -295,6 +297,14 @@ class TestCgnatTranslate(CgnatPgCase):
         self.assertEqual(self.err("cgnat-out2in", "no-mapping") - before, 1)
         self.assertNotIn("192.0.2.1", self.vapi.cli("show cgnat sessions"))
 
+    def test_outside_cannot_reach_inside(self):
+        """Outside traffic addressed to a subscriber's inside address is dropped"""
+        before = self.err("cgnat-out2in", "to-inside")
+        p = self.out_pkt(self.pg1.remote_ip4, 4444, self.host(), 5000)
+        self.send_and_assert_no_replies(self.pg1, [p], remark="to inside")
+        if not self.in_vrf:  # separate tables: routing can't get there anyway
+            self.assertEqual(self.err("cgnat-out2in", "to-inside") - before, 1)
+
     def test_non_pool_outside_passes(self):
         """Outside traffic not addressed to the pool is untouched (e.g. to VPP itself)"""
         p = (
@@ -304,6 +314,27 @@ class TestCgnatTranslate(CgnatPgCase):
         )
         rx = self.send_and_expect(self.pg1, [p], self.pg1)[0]
         self.assertEqual(rx[ICMP].type, 0)
+
+    def test_ip_options_dropped(self):
+        """Packets with IPv4 options are never forwarded, either direction"""
+        # (VPP's ip4-input punts these before the feature arc; the plugin
+        # also refuses them itself, since sv-reass reports no ports)
+        h, r = self.host(), self.pg1.remote_ip4
+        p = (
+            Ether(src=self.pg0.remote_mac, dst=self.pg0.local_mac)
+            / IP(src=h, dst=r, options=[IPOption_RR()])
+            / UDP(sport=5500, dport=53)
+            / Raw(b"x" * 16)
+        )
+        self.send_and_assert_no_replies(self.pg0, [p], remark="options in")
+        rx = self.in2out(h, 5500, r, 53)
+        p = (
+            Ether(src=self.pg1.remote_mac, dst=self.pg1.local_mac)
+            / IP(src=r, dst=rx[IP].src, options=[IPOption_RR()])
+            / UDP(sport=53, dport=rx[UDP].sport)
+            / Raw(b"y" * 16)
+        )
+        self.send_and_assert_no_replies(self.pg1, [p], remark="options out")
 
     def test_fragments_translated(self):
         """Fragmented UDP: every fragment is translated consistently"""
@@ -321,13 +352,22 @@ class TestCgnatTranslate(CgnatPgCase):
         self.assert_packet_checksums_valid(whole)
 
 
+class TestCgnatTranslateInsideTable(TestCgnatTranslate):
+    """CGNAT translation with the inside interface in its own table (optional)"""
+
+    in_vrf = 1
+
+
 class TestCgnatPolicy(CgnatPgCase):
     """CGNAT policy: filtering, port collisions, session cap"""
 
     def tearDown(self):
         if not self.vpp_dead:
             self.vapi.cgnat_set_filtering(endpoint_independent=0)
-            self.vapi.cgnat_set_session_limit(per_subscriber=1000)
+            self.vapi.cgnat_set_session_limit(
+                per_subscriber=1000, inbound_per_subscriber=250
+            )
+            self.vapi.cli("cgnat max-sessions-per-thread 1048576")
         super().tearDown()
 
     def test_address_dependent_blocks_new_remote(self):
@@ -375,6 +415,35 @@ class TestCgnatPolicy(CgnatPgCase):
         self.send_and_assert_no_replies(self.pg0, [p], remark="over cap")
         self.assertEqual(self.err("cgnat-in2out", "cap") - before, 1)
         self.in2out(b, 9004, self.pg1.remote_ip4, 53)
+
+
+    def test_inbound_cannot_exhaust_cap(self):
+        """Inbound-created sessions have their own limit and never block outbound"""
+        self.vapi.cgnat_set_filtering(endpoint_independent=1)
+        self.vapi.cgnat_set_session_limit(per_subscriber=3, inbound_per_subscriber=2)
+        h, r = self.host(), self.pg1.remote_ip4
+        rx = self.in2out(h, 9100, r, 53)
+        out, port = rx[IP].src, rx[UDP].sport
+        attacker = self.pg1.remote_hosts[1].ip4
+        before = self.err("cgnat-out2in", "cap")
+        pkts = [self.out_pkt(attacker, 40000 + i, out, port) for i in range(5)]
+        self.send_and_expect(self.pg1, pkts, self.pg0, n_rx=2)
+        self.assertEqual(self.err("cgnat-out2in", "cap") - before, 3)
+        for sport in (9101, 9102):
+            self.in2out(h, sport, r, 53)
+
+    def test_table_full(self):
+        """Per-thread session ceiling: new sessions beyond it are dropped (table-full)"""
+        if self.vpp_worker_count:
+            self.skipTest("ceiling is per thread; subscriber placement varies")
+        self.vapi.cli("cgnat max-sessions-per-thread 2")
+        r = self.pg1.remote_ip4
+        self.in2out(self.host(0), 9201, r, 53)
+        self.in2out(self.host(1), 9202, r, 53)
+        before = self.err("cgnat-in2out", "table-full")
+        p = self.in_pkt(self.host(2), 9203, r, 53)
+        self.send_and_assert_no_replies(self.pg0, [p], remark="table full")
+        self.assertEqual(self.err("cgnat-in2out", "table-full") - before, 1)
 
 
 class TestCgnatExhaust(CgnatPgCase):
@@ -502,6 +571,30 @@ class TestCgnatHairpin(CgnatPgCase):
         self.assertEqual((rx[IP].src, rx[UDP].sport), (out_b, port_b))
 
 
+class TestCgnatHairpinSessions(TestCgnatHairpin):
+    """CGNAT hairpinned TCP keeps one session per side"""
+
+    def test_hairpin_tcp_sessions(self):
+        """Hairpinned TCP: one session per side, both established after SYN/SYN-ACK"""
+        self.vapi.cgnat_set_filtering(endpoint_independent=1)
+        a, b = self.host(0), self.host(1)
+        rx = self.in2out(b, 7100, self.pg1.remote_ip4, 80, TCP, flags="S")
+        out_b, port_b = rx[IP].src, rx[TCP].sport
+        out_a, port_a = self.first_choice(a, 7600)
+        p = self.in_pkt(a, 7600, out_b, port_b, TCP, flags="S")
+        self.send_and_expect(self.pg0, [p], self.pg0)
+        p = self.in_pkt(b, 7100, out_a, port_a, TCP, flags="SA")
+        self.send_and_expect(self.pg0, [p], self.pg0)
+        lines = [
+            l for l in self.vapi.cli("show cgnat sessions").splitlines() if "thread" in l
+        ]
+        self.assertEqual(len(lines), 3, lines)
+        hp = [l for l in lines if "<-> %s:" % out_a in l or "<-> %s:%d " % (out_b, port_b) in l]
+        self.assertEqual(len(hp), 2, lines)
+        for l in hp:
+            self.assertIn("tcp-established", l)
+
+
 class TestCgnatTimers(CgnatPgCase):
     """CGNAT timers and expiry"""
 
@@ -582,6 +675,23 @@ class TestCgnatTimers(CgnatPgCase):
         self.expire(4)
         again = self.in2out(h, 5300, self.pg1.remote_ip4, 53)[UDP].sport
         self.assertEqual(first, again)
+
+    def test_expiry_keeps_up_with_volume(self):
+        """12000 idle sessions (more than any fixed per-tick budget) all expire promptly"""
+        self.set_timeouts(udp=600)
+        r = self.pg1.remote_ip4
+        net = ipaddress.ip_network(self.inside_net() + "/24")
+        pkts = [
+            self.in_pkt(str(net[10 + i // 500]), 20000 + i % 500, r, 53)
+            for i in range(12000)
+        ]
+        self.send_and_expect(self.pg0, pkts, self.pg1)
+        self.assertEqual(self.vapi.cgnat_get_status().sessions, 12000)
+        # real time only: every session is idle > 1s now; the walker must
+        # clear all 12000 within ~0.6s of the next tick
+        self.set_timeouts(udp=1)
+        self.sleep(1.6)
+        self.assertEqual(self.vapi.cgnat_get_status().sessions, 0)
 
     def test_traffic_keeps_alive(self):
         """Traffic refreshes the timer"""

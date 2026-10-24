@@ -324,11 +324,14 @@ show_cgnat_status_fn (vlib_main_t *vm, unformat_input_t *input,
 		   cgnat_counter_total (CGNAT_COUNTER_SUBSCRIBERS),
 		   cgnat_counter_total (CGNAT_COUNTER_MAPPINGS),
 		   cgnat_counter_total (CGNAT_COUNTER_SESSIONS));
-  vlib_cli_output (vm, "filtering %s, sessions per subscriber %u",
+  vlib_cli_output (vm,
+		   "filtering %s, sessions per subscriber %u (+%u inbound), "
+		   "max %u per thread",
 		   cm->endpoint_independent_filtering ?
 		     "endpoint-independent" :
 		     "address-dependent",
-		   cm->sessions_per_sub);
+		   cm->sessions_per_sub, cm->inbound_sessions_per_sub,
+		   cm->max_sessions_per_thread);
   vlib_cli_output (vm,
 		   "timeouts: tcp-established %us tcp-transitory %us udp %us "
 		   "icmp %us",
@@ -344,4 +347,41 @@ VLIB_CLI_COMMAND (show_cgnat_status_command, static) = {
   .path = "show cgnat status",
   .short_help = "show cgnat status",
   .function = show_cgnat_status_fn,
+};
+
+static clib_error_t *
+cgnat_inbound_limit_fn (vlib_main_t *vm, unformat_input_t *input,
+			vlib_cli_command_t *cmd)
+{
+  u32 n;
+
+  if (!unformat (input, "%u", &n))
+    return clib_error_return (
+      0, "usage: cgnat inbound-sessions-per-subscriber <n>");
+  cgnat_main.inbound_sessions_per_sub = n;
+  return 0;
+}
+
+VLIB_CLI_COMMAND (cgnat_inbound_limit_command, static) = {
+  .path = "cgnat inbound-sessions-per-subscriber",
+  .short_help = "cgnat inbound-sessions-per-subscriber <n>",
+  .function = cgnat_inbound_limit_fn,
+};
+
+static clib_error_t *
+cgnat_max_sessions_fn (vlib_main_t *vm, unformat_input_t *input,
+		       vlib_cli_command_t *cmd)
+{
+  u32 n;
+
+  if (!unformat (input, "%u", &n) || !n)
+    return clib_error_return (0, "usage: cgnat max-sessions-per-thread <n>");
+  cgnat_main.max_sessions_per_thread = n;
+  return 0;
+}
+
+VLIB_CLI_COMMAND (cgnat_max_sessions_command, static) = {
+  .path = "cgnat max-sessions-per-thread",
+  .short_help = "cgnat max-sessions-per-thread <n>",
+  .function = cgnat_max_sessions_fn,
 };

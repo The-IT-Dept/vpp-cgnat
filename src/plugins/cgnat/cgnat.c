@@ -83,6 +83,8 @@ cgnat_init (vlib_main_t *vm)
   cm->timeouts[CGNAT_TO_UDP] = 300;
   cm->timeouts[CGNAT_TO_ICMP] = 60;
   cm->sessions_per_sub = 1000;
+  cm->inbound_sessions_per_sub = 250;
+  cm->max_sessions_per_thread = 1 << 20;
   cm->endpoint_independent_filtering = 0;
 
   cm->first_worker_index = 0;
@@ -128,7 +130,9 @@ uword unformat_cgnat_timeouts (unformat_input_t *input, va_list *args);
 /*
  * startup.conf:
  *   cgnat {
- *     sessions-per-subscriber <n>
+ *     sessions-per-subscriber <n>          (outbound-created, default 1000)
+ *     inbound-sessions-per-subscriber <n>  (inbound-created, default 250)
+ *     max-sessions-per-thread <n>          (default 1048576)
  *     timeouts { tcp-established <s> tcp-transitory <s> udp <s> icmp <s> }
  *     filtering address-dependent | endpoint-independent
  *   }
@@ -144,8 +148,20 @@ cgnat_config (vlib_main_t *vm, unformat_input_t *input)
   clib_memcpy (t, cm->timeouts, sizeof (t));
   while (unformat_check_input (input) != UNFORMAT_END_OF_INPUT)
     {
-      if (unformat (input, "sessions-per-subscriber %u", &n) && n)
-	cm->sessions_per_sub = n;
+      if (unformat (input, "sessions-per-subscriber %u", &n))
+	{
+	  if (!n)
+	    return clib_error_return (0, "cgnat: sessions-per-subscriber 0");
+	  cm->sessions_per_sub = n;
+	}
+      else if (unformat (input, "inbound-sessions-per-subscriber %u", &n))
+	cm->inbound_sessions_per_sub = n;
+      else if (unformat (input, "max-sessions-per-thread %u", &n))
+	{
+	  if (!n)
+	    return clib_error_return (0, "cgnat: max-sessions-per-thread 0");
+	  cm->max_sessions_per_thread = n;
+	}
       else if (unformat (input, "timeouts %U", unformat_vlib_cli_sub_input,
 			 &sub))
 	{

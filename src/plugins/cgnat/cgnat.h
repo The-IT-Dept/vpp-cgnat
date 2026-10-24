@@ -80,6 +80,7 @@ typedef struct
   u16 remote_port; /* network order; 0 for ICMP */
   u8 tcp_state;
   u8 to_class;
+  u8 inbound; /* created by an inbound packet (counts against inbound cap) */
   f64 last_heard;
   u32 lru_index;
 } cgnat_session_t;
@@ -89,7 +90,8 @@ typedef struct
 {
   ip4_address_t in_addr;
   u32 in_fib_index;
-  u32 n_sessions;
+  u32 n_sessions; /* all sessions */
+  u32 n_inbound;  /* of which created by inbound packets */
   u32 n_mappings;
 } cgnat_sub_t;
 
@@ -125,7 +127,9 @@ typedef struct
 
   /* policy */
   u32 timeouts[CGNAT_N_TO];
-  u32 sessions_per_sub;
+  u32 sessions_per_sub;	  /* outbound-created sessions per subscriber */
+  u32 inbound_sessions_per_sub; /* inbound-created sessions per subscriber */
+  u32 max_sessions_per_thread;
   u8 endpoint_independent_filtering;
 
   /*

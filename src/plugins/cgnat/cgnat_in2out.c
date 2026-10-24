@@ -18,6 +18,8 @@
   _ (EXHAUSTED, "exhausted", "subscriber port block exhausted")               \
   _ (UNSUPPORTED, "unsupported", "protocol not translated")                   \
   _ (TRUNCATED, "truncated", "L4 header truncated")                           \
+  _ (OPTIONS, "options", "IPv4 options not translated")                       \
+  _ (TABLE_FULL, "table-full", "thread session table full")                   \
   _ (CONGESTION, "congestion", "handoff queue full")
 
 typedef enum
@@ -111,7 +113,6 @@ cgnat_in2out_one (vlib_main_t *vm, vlib_node_runtime_t *node, cgnat_per_thread_t
 		  u32 thread_index, vlib_buffer_t *b, f64 now,
 		  cgnat_mapping_t **mp, cgnat_session_t **sp, u16 *owner)
 {
-  cgnat_main_t *cm = &cgnat_main;
   ip4_header_t *ip = vlib_buffer_get_current (b);
   int non_first = vnet_buffer (b)->ip.reass.is_non_first_fragment;
   u32 rx_fib, next;
@@ -151,6 +152,12 @@ cgnat_in2out_one (vlib_main_t *vm, vlib_node_runtime_t *node, cgnat_per_thread_t
 				    CGNAT_IN2OUT_ERROR_NO_MAP];
       return CGNAT_IN2OUT_NEXT_DROP;
     }
+  if (PREDICT_FALSE (ip->ip_version_and_header_length != 0x45))
+    {
+      /* sv-reass reports no ports for these: never guess */
+      b->error = node->errors[CGNAT_IN2OUT_ERROR_OPTIONS];
+      return CGNAT_IN2OUT_NEXT_DROP;
+    }
   if (PREDICT_FALSE (vnet_buffer (b)->ip.reass.l4_hdr_truncated))
     {
       b->error = node->errors[CGNAT_IN2OUT_ERROR_TRUNCATED];
@@ -168,6 +175,7 @@ cgnat_in2out_one (vlib_main_t *vm, vlib_node_runtime_t *node, cgnat_per_thread_t
   in_port = vnet_buffer (b)->ip.reass.l4_src_port;
   r_port = proto == CGNAT_PROTO_ICMP ? 0 : vnet_buffer (b)->ip.reass.l4_dst_port;
 
+again:
   m = cgnat_mapping_find (t, 0, rx_fib, ip->src_address.as_u32, in_port,
 			  proto);
   if (PREDICT_FALSE (!m))
@@ -177,8 +185,13 @@ cgnat_in2out_one (vlib_main_t *vm, vlib_node_runtime_t *node, cgnat_per_thread_t
 
       if (cgnat_is_local (rx_fib, &ip->dst_address))
 	goto pass;
+      if (cgnat_table_full (t))
+	{
+	  b->error = node->errors[CGNAT_IN2OUT_ERROR_TABLE_FULL];
+	  return CGNAT_IN2OUT_NEXT_DROP;
+	}
       sub = cgnat_sub_get (t, thread_index, rx_fib, &ip->src_address, 1);
-      if (sub->n_sessions >= cm->sessions_per_sub)
+      if (cgnat_sub_full (sub, 0))
 	{
 	  b->error = node->errors[CGNAT_IN2OUT_ERROR_CAP];
 	  cgnat_sub_put_if_idle (t, thread_index, sub);
@@ -199,17 +212,25 @@ cgnat_in2out_one (vlib_main_t *vm, vlib_node_runtime_t *node, cgnat_per_thread_t
     }
 
   s = cgnat_session_find (t, m - t->mappings, ip->dst_address.as_u32, r_port);
+  if (PREDICT_FALSE (s && cgnat_session_expired (s, now)))
+    {
+      /* expired but not yet walked: start afresh (may free the mapping) */
+      cgnat_session_free (t, thread_index, s);
+      goto again;
+    }
   if (PREDICT_FALSE (!s))
     {
       sub = pool_elt_at_index (t->subs_pool, m->sub_index);
-      if (sub->n_sessions >= cm->sessions_per_sub)
+      if (cgnat_table_full (t) || cgnat_sub_full (sub, 0))
 	{
-	  b->error = node->errors[CGNAT_IN2OUT_ERROR_CAP];
+	  b->error = node->errors[cgnat_table_full (t) ?
+				    CGNAT_IN2OUT_ERROR_TABLE_FULL :
+				    CGNAT_IN2OUT_ERROR_CAP];
 	  cgnat_mapping_free_if_idle (t, thread_index, m);
 	  return CGNAT_IN2OUT_NEXT_DROP;
 	}
       s = cgnat_session_create (t, thread_index, m, ip->dst_address.as_u32,
-				r_port, CGNAT_TO_TCP_TRANS, now);
+				r_port, CGNAT_TO_TCP_TRANS, now, 0);
     }
   cgnat_session_touch (t, s, cgnat_session_class (s, proto, b, 1), now);
 
@@ -220,7 +241,11 @@ cgnat_in2out_one (vlib_main_t *vm, vlib_node_runtime_t *node, cgnat_per_thread_t
   /* to another subscriber's public address: translate it back in */
   if (PREDICT_FALSE (cgnat_map_by_outside (m->out_fib_index,
 					   &ip->dst_address) != 0))
-    return CGNAT_IN2OUT_NEXT_HAIRPIN;
+    {
+      /* the hairpin side keys on the translated source port */
+      vnet_buffer (b)->ip.reass.l4_src_port = m->out_port;
+      return CGNAT_IN2OUT_NEXT_HAIRPIN;
+    }
   return CGNAT_IN2OUT_NEXT_LOOKUP;
 
 pass:

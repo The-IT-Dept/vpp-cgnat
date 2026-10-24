@@ -17,6 +17,9 @@
   _ (CAP, "cap", "subscriber session limit reached")                          \
   _ (UNSUPPORTED, "unsupported", "protocol not translated")                   \
   _ (TRUNCATED, "truncated", "L4 header truncated")                           \
+  _ (OPTIONS, "options", "IPv4 options not translated")                       \
+  _ (TO_INSIDE, "to-inside", "outside traffic addressed to an inside prefix") \
+  _ (TABLE_FULL, "table-full", "thread session table full")                   \
   _ (CONGESTION, "congestion", "handoff queue full")
 
 typedef enum
@@ -129,6 +132,13 @@ cgnat_out2in_one (vlib_main_t *vm, vlib_node_runtime_t *node,
   map = cgnat_map_by_outside (rx_fib, &ip->dst_address);
   if (!map)
     {
+      /* with inside and outside in one table, never route the outside
+	 straight to a subscriber */
+      if (!is_hairpin && cgnat_map_by_inside (rx_fib, &ip->dst_address))
+	{
+	  b->error = node->errors[CGNAT_OUT2IN_ERROR_TO_INSIDE];
+	  return CGNAT_OUT2IN_NEXT_DROP;
+	}
       if (is_hairpin)
 	{
 	  b->error = node->errors[CGNAT_OUT2IN_ERROR_NO_MAPPING];
@@ -136,6 +146,12 @@ cgnat_out2in_one (vlib_main_t *vm, vlib_node_runtime_t *node,
 	}
       vnet_feature_next (&next, b);
       return next;
+    }
+
+  if (PREDICT_FALSE (ip->ip_version_and_header_length != 0x45))
+    {
+      b->error = node->errors[CGNAT_OUT2IN_ERROR_OPTIONS];
+      return CGNAT_OUT2IN_NEXT_DROP;
     }
 
   /* the subscriber, by the reverse formula, picks the owner thread */
@@ -186,6 +202,17 @@ cgnat_out2in_one (vlib_main_t *vm, vlib_node_runtime_t *node,
     }
 
   s = cgnat_session_find (t, m - t->mappings, ip->src_address.as_u32, r_port);
+  if (PREDICT_FALSE (s && cgnat_session_expired (s, now)))
+    {
+      u32 mi = m - t->mappings;
+      cgnat_session_free (t, thread_index, s);
+      s = 0;
+      if (pool_is_free_index (t->mappings, mi))
+	{
+	  b->error = node->errors[CGNAT_OUT2IN_ERROR_NO_MAPPING];
+	  return CGNAT_OUT2IN_NEXT_DROP;
+	}
+    }
   if (PREDICT_FALSE (!s))
     {
       if (!cm->endpoint_independent_filtering &&
@@ -195,13 +222,20 @@ cgnat_out2in_one (vlib_main_t *vm, vlib_node_runtime_t *node,
 	  return CGNAT_OUT2IN_NEXT_DROP;
 	}
       sub = pool_elt_at_index (t->subs_pool, m->sub_index);
-      if (sub->n_sessions >= cm->sessions_per_sub)
+      if (cgnat_table_full (t))
+	{
+	  b->error = node->errors[CGNAT_OUT2IN_ERROR_TABLE_FULL];
+	  return CGNAT_OUT2IN_NEXT_DROP;
+	}
+      /* inbound sessions have their own cap: outsiders can't use up the
+	 subscriber's outbound sessions */
+      if (cgnat_sub_full (sub, 1))
 	{
 	  b->error = node->errors[CGNAT_OUT2IN_ERROR_CAP];
 	  return CGNAT_OUT2IN_NEXT_DROP;
 	}
       s = cgnat_session_create (t, thread_index, m, ip->src_address.as_u32,
-				r_port, CGNAT_TO_TCP_TRANS, now);
+				r_port, CGNAT_TO_TCP_TRANS, now, 1);
     }
   cgnat_session_touch (t, s, cgnat_session_class (s, proto, b, 0), now);
 

@@ -98,11 +98,17 @@ autoreply define cgnat_set_filtering {
   bool endpoint_independent;
 };
 
-/** \brief Maximum sessions per subscriber (default 1000) */
+/** \brief Session limits per subscriber
+    @param per_subscriber - sessions the subscriber opens (default 1000)
+    @param inbound_per_subscriber - sessions opened towards the subscriber
+           by inbound packets, a separate budget so outsiders can't use up
+           the subscriber's own (default 250); 0 leaves it unchanged
+*/
 autoreply define cgnat_set_session_limit {
   u32 client_index;
   u32 context;
   u32 per_subscriber;
+  u32 inbound_per_subscriber;
 };
 
 /** \brief Session idle timeouts, seconds
@@ -163,6 +169,8 @@ define cgnat_get_status_reply {
   u64 subscribers;
   bool endpoint_independent_filtering;
   u32 sessions_per_subscriber;
+  u32 inbound_sessions_per_subscriber;
+  u32 max_sessions_per_thread;
   u32 tcp_established_timeout;
   u32 tcp_transitory_timeout;
   u32 udp_timeout;

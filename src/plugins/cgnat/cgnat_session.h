@@ -91,7 +91,31 @@ cgnat_mapping_t *cgnat_mapping_create (cgnat_per_thread_t *t,
 cgnat_session_t *cgnat_session_create (cgnat_per_thread_t *t,
 				       u32 thread_index,
 				       cgnat_mapping_t *mapping, u32 raddr,
-				       u16 rport, u8 to_class, f64 now);
+				       u16 rport, u8 to_class, f64 now,
+				       int inbound);
+
+/* has the session been idle past its timeout? (walker may not have run) */
+static_always_inline int
+cgnat_session_expired (cgnat_session_t *s, f64 now)
+{
+  return now - s->last_heard >= cgnat_main.timeouts[s->to_class];
+}
+
+/* room for one more session on this thread / for this subscriber? */
+static_always_inline int
+cgnat_table_full (cgnat_per_thread_t *t)
+{
+  return pool_elts (t->sessions_pool) >= cgnat_main.max_sessions_per_thread;
+}
+
+static_always_inline int
+cgnat_sub_full (cgnat_sub_t *sub, int inbound)
+{
+  cgnat_main_t *cm = &cgnat_main;
+  if (inbound)
+    return sub->n_inbound >= cm->inbound_sessions_per_sub;
+  return sub->n_sessions - sub->n_inbound >= cm->sessions_per_sub;
+}
 
 /* frees the session, and its mapping and subscriber when they go idle */
 void cgnat_session_free (cgnat_per_thread_t *t, u32 thread_index,

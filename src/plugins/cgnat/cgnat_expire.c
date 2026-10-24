@@ -5,16 +5,21 @@
 
 /*
  * Session expiry.  Each thread owns its sessions, so each thread expires
- * its own: a process on main raises an interrupt on every thread once a
- * second, and the per-thread input node walks each timeout class's LRU
- * list from the oldest end until it meets a live session.
+ * its own: a process on main raises an interrupt on every thread ten times
+ * a second, and the per-thread input node walks each timeout class's LRU
+ * list from the oldest end until it meets a live session.  A run does at
+ * most CGNAT_EXPIRE_SLICE of work, then re-arms itself so a large backlog
+ * drains over the next loops without stalling forwarding.  Lookups treat
+ * expired-but-unwalked sessions as gone, so the walker's pace never
+ * changes behaviour, only memory.
  */
 
 #include <vlib/vlib.h>
 #include <cgnat/cgnat.h>
 #include <cgnat/cgnat_session.h>
 
-#define CGNAT_EXPIRE_BUDGET 4096 /* sessions freed per thread per tick */
+#define CGNAT_EXPIRE_SLICE 0.5e-3 /* seconds of work per run */
+#define CGNAT_EXPIRE_TICK  0.1	   /* seconds between runs */
 
 VLIB_NODE_FN (cgnat_expire_walk_node)
 (vlib_main_t *vm, vlib_node_runtime_t *node, vlib_frame_t *frame)
@@ -24,15 +29,22 @@ VLIB_NODE_FN (cgnat_expire_walk_node)
   cgnat_per_thread_t *t = vec_elt_at_index (cm->per_thread, thread_index);
   f64 now = vlib_time_now (vm);
   u32 n = 0;
-  int c;
+  int c, more = 0;
 
   for (c = 0; c < CGNAT_N_TO; c++)
     {
       u32 head = t->lru_head[c];
       f64 timeout = cm->timeouts[c];
 
-      while (n < CGNAT_EXPIRE_BUDGET)
+      while (1)
 	{
+	  /* yield to the data path; run again on the next loop */
+	  if ((n & 255) == 255 &&
+	      vlib_time_now (vm) - now > CGNAT_EXPIRE_SLICE)
+	    {
+	      more = 1;
+	      goto done;
+	    }
 	  u32 oldest = pool_elt_at_index (t->lru_pool, head)->next;
 	  cgnat_session_t *s;
 
@@ -46,6 +58,9 @@ VLIB_NODE_FN (cgnat_expire_walk_node)
 	  n++;
 	}
     }
+done:
+  if (more)
+    vlib_node_set_interrupt_pending (vm, node->node_index);
   return n;
 }
 
@@ -64,7 +79,7 @@ cgnat_expire_process (vlib_main_t *vm, vlib_node_runtime_t *rt,
     {
       u32 ti;
 
-      vlib_process_wait_for_event_or_clock (vm, 1.0);
+      vlib_process_wait_for_event_or_clock (vm, CGNAT_EXPIRE_TICK);
       vlib_process_get_events (vm, 0);
       for (ti = 0; ti < vlib_get_n_threads (); ti++)
 	vlib_node_set_interrupt_pending (vlib_get_main_by_index (ti),

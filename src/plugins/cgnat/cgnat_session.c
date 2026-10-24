@@ -130,10 +130,11 @@ adf_ref (cgnat_per_thread_t *t, u32 mapping_index, u32 raddr, int delta)
 cgnat_session_t *
 cgnat_session_create (cgnat_per_thread_t *t, u32 thread_index,
 		      cgnat_mapping_t *m, u32 raddr, u16 rport, u8 to_class,
-		      f64 now)
+		      f64 now, int inbound)
 {
   clib_bihash_kv_16_8_t kv;
   cgnat_session_t *s;
+  cgnat_sub_t *sub;
   dlist_elt_t *e;
   u32 mi = m - t->mappings;
 
@@ -143,6 +144,7 @@ cgnat_session_create (cgnat_per_thread_t *t, u32 thread_index,
   s->remote_port = rport;
   s->to_class = to_class;
   s->last_heard = now;
+  s->inbound = inbound;
 
   pool_get (t->lru_pool, e);
   s->lru_index = e - t->lru_pool;
@@ -155,7 +157,9 @@ cgnat_session_create (cgnat_per_thread_t *t, u32 thread_index,
   adf_ref (t, mi, raddr, 1);
 
   m->n_sessions++;
-  pool_elt_at_index (t->subs_pool, m->sub_index)->n_sessions++;
+  sub = pool_elt_at_index (t->subs_pool, m->sub_index);
+  sub->n_sessions++;
+  sub->n_inbound += inbound;
   cgnat_gauge (thread_index, CGNAT_COUNTER_SESSIONS, 1);
   return s;
 }
@@ -166,6 +170,8 @@ cgnat_session_free (cgnat_per_thread_t *t, u32 thread_index,
 {
   clib_bihash_kv_16_8_t kv;
   cgnat_mapping_t *m = pool_elt_at_index (t->mappings, s->mapping_index);
+  cgnat_sub_t *sub = pool_elt_at_index (t->subs_pool, m->sub_index);
+  u8 inbound = s->inbound;
 
   cgnat_session_kv (&kv, s->mapping_index, s->remote_addr.as_u32,
 		    s->remote_port);
@@ -177,7 +183,8 @@ cgnat_session_free (cgnat_per_thread_t *t, u32 thread_index,
   cgnat_gauge (thread_index, CGNAT_COUNTER_SESSIONS, -1);
 
   m->n_sessions--;
-  pool_elt_at_index (t->subs_pool, m->sub_index)->n_sessions--;
+  sub->n_sessions--;
+  sub->n_inbound -= inbound;
   cgnat_mapping_free_if_idle (t, thread_index, m);
 }
 

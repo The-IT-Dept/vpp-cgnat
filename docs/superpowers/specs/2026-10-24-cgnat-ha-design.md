@@ -129,7 +129,10 @@ sessions. Neither has per-subscriber port blocks except det44's static ones.
 ## Constraints
 
 - VPP 26.06, in C.
-- Inside and outside in separate FIBs (VRFs).
+- One VPP table by default: inside and outside both in table 0. These are the
+  box's own FIB tables, not the router's VRFs. Separate inside and outside
+  tables are optional. (Nick, 2026-10-24: "single table default and keep it
+  optional".) Outside traffic to an inside prefix is always dropped.
 - Coexists with VPP's own plugins.
 - Builds in-tree in a VPP checkout to start; out-of-tree packaging comes later.
 

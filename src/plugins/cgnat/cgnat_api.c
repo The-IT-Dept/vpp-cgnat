@@ -143,12 +143,17 @@ vl_api_cgnat_set_session_limit_t_handler (
   cgnat_main_t *cm = &cgnat_main;
   vl_api_cgnat_set_session_limit_reply_t *rmp;
   u32 limit = ntohl (mp->per_subscriber);
+  u32 inbound = ntohl (mp->inbound_per_subscriber);
   int rv = 0;
 
   if (limit == 0)
     rv = VNET_API_ERROR_INVALID_VALUE;
   else
-    cm->sessions_per_sub = limit;
+    {
+      cm->sessions_per_sub = limit;
+      if (inbound)
+	cm->inbound_sessions_per_sub = inbound;
+    }
   REPLY_MACRO (VL_API_CGNAT_SET_SESSION_LIMIT_REPLY);
 }
 
@@ -252,6 +257,9 @@ vl_api_cgnat_get_status_t_handler (vl_api_cgnat_get_status_t *mp)
       clib_host_to_net_u64 (cgnat_counter_total (CGNAT_COUNTER_SUBSCRIBERS));
     rmp->endpoint_independent_filtering = cm->endpoint_independent_filtering;
     rmp->sessions_per_subscriber = htonl (cm->sessions_per_sub);
+    rmp->inbound_sessions_per_subscriber =
+      htonl (cm->inbound_sessions_per_sub);
+    rmp->max_sessions_per_thread = htonl (cm->max_sessions_per_thread);
     rmp->tcp_established_timeout = htonl (cm->timeouts[CGNAT_TO_TCP_EST]);
     rmp->tcp_transitory_timeout = htonl (cm->timeouts[CGNAT_TO_TCP_TRANS]);
     rmp->udp_timeout = htonl (cm->timeouts[CGNAT_TO_UDP]);
