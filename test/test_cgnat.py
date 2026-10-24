@@ -502,5 +502,96 @@ class TestCgnatHairpin(CgnatPgCase):
         self.assertEqual((rx[IP].src, rx[UDP].sport), (out_b, port_b))
 
 
+class TestCgnatTimers(CgnatPgCase):
+    """CGNAT timers and expiry"""
+
+    def tearDown(self):
+        if not self.vpp_dead:
+            self.vapi.cgnat_set_timeouts(
+                tcp_established=7440, tcp_transitory=240, udp=300, icmp=60
+            )
+        super().tearDown()
+
+    def set_timeouts(self, est=2, trans=2, udp=2, icmp=2):
+        self.vapi.cgnat_set_timeouts(
+            tcp_established=est, tcp_transitory=trans, udp=udp, icmp=icmp
+        )
+
+    def expire(self, seconds):
+        """Move VPP's clock on, then give the 1s expiry walk time to run"""
+        self.virtual_sleep(seconds)
+        self.sleep(1.5)
+
+    def sessions(self):
+        return [
+            l for l in self.vapi.cli("show cgnat sessions").splitlines() if "thread" in l
+        ]
+
+    def test_udp_expires(self):
+        """Idle UDP session and its mapping expire"""
+        self.set_timeouts()
+        self.in2out(self.host(), 5000, self.pg1.remote_ip4, 53)
+        self.assertEqual(len(self.sessions()), 1)
+        self.expire(4)
+        self.assertEqual(self.sessions(), [])
+
+    def test_tcp_fin_goes_transitory(self):
+        """TCP closed by FIN both ways falls to the transitory timeout"""
+        self.set_timeouts(est=60, trans=2)
+        h, r = self.host(), self.pg1.remote_ip4
+        rx = self.in2out(h, 6000, r, 80, TCP, flags="S")
+        out, port = rx[IP].src, rx[TCP].sport
+        self.out2in_ok(self.out_pkt(r, 80, out, port, TCP, flags="SA"), h, 6000)
+        self.in2out(h, 6000, r, 80, TCP, flags="A")
+        self.assertIn("tcp-established", self.sessions()[0])
+        self.in2out(h, 6000, r, 80, TCP, flags="FA")
+        self.out2in_ok(self.out_pkt(r, 80, out, port, TCP, flags="FA"), h, 6000)
+        self.assertIn("tcp-transitory", self.sessions()[0])
+        self.expire(4)
+        self.assertEqual(self.sessions(), [])
+
+    def test_tcp_rst_goes_transitory(self):
+        """TCP reset falls to the transitory timeout"""
+        self.set_timeouts(est=60, trans=2)
+        h, r = self.host(), self.pg1.remote_ip4
+        rx = self.in2out(h, 6100, r, 80, TCP, flags="S")
+        out, port = rx[IP].src, rx[TCP].sport
+        self.out2in_ok(self.out_pkt(r, 80, out, port, TCP, flags="SA"), h, 6100)
+        self.in2out(h, 6100, r, 80, TCP, flags="A")
+        self.out2in_ok(self.out_pkt(r, 80, out, port, TCP, flags="R"), h, 6100)
+        self.assertIn("tcp-transitory", self.sessions()[0])
+        self.expire(4)
+        self.assertEqual(self.sessions(), [])
+
+    def test_established_outlives_transitory(self):
+        """Established TCP survives past the transitory timeout"""
+        self.set_timeouts(est=60, trans=2)
+        h, r = self.host(), self.pg1.remote_ip4
+        rx = self.in2out(h, 6200, r, 80, TCP, flags="S")
+        out, port = rx[IP].src, rx[TCP].sport
+        self.out2in_ok(self.out_pkt(r, 80, out, port, TCP, flags="SA"), h, 6200)
+        self.in2out(h, 6200, r, 80, TCP, flags="A")
+        self.expire(4)
+        self.assertEqual(len(self.sessions()), 1)
+
+    def test_same_port_after_expiry(self):
+        """After expiry the same inside port gets the same outside port"""
+        self.set_timeouts()
+        h = self.host()
+        first = self.in2out(h, 5300, self.pg1.remote_ip4, 53)[UDP].sport
+        self.expire(4)
+        again = self.in2out(h, 5300, self.pg1.remote_ip4, 53)[UDP].sport
+        self.assertEqual(first, again)
+
+    def test_traffic_keeps_alive(self):
+        """Traffic refreshes the timer"""
+        self.set_timeouts(udp=5)
+        h = self.host()
+        for _ in range(4):  # ~14s in total, each gap ~3.5s
+            self.in2out(h, 5400, self.pg1.remote_ip4, 53)
+            self.expire(2)
+        self.assertEqual(len(self.sessions()), 1)
+
+
 if __name__ == "__main__":
     unittest.main(testRunner=VppTestRunner)

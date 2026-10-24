@@ -151,6 +151,26 @@ vl_api_cgnat_set_session_limit_t_handler (
   REPLY_MACRO (VL_API_CGNAT_SET_SESSION_LIMIT_REPLY);
 }
 
+static void
+vl_api_cgnat_set_timeouts_t_handler (vl_api_cgnat_set_timeouts_t *mp)
+{
+  cgnat_main_t *cm = &cgnat_main;
+  vl_api_cgnat_set_timeouts_reply_t *rmp;
+  u32 v[CGNAT_N_TO];
+  int rv = 0, i;
+
+  v[CGNAT_TO_TCP_EST] = ntohl (mp->tcp_established);
+  v[CGNAT_TO_TCP_TRANS] = ntohl (mp->tcp_transitory);
+  v[CGNAT_TO_UDP] = ntohl (mp->udp);
+  v[CGNAT_TO_ICMP] = ntohl (mp->icmp);
+  for (i = 0; i < CGNAT_N_TO; i++)
+    if (v[i] == 0)
+      rv = VNET_API_ERROR_INVALID_VALUE;
+  if (!rv)
+    clib_memcpy (cm->timeouts, v, sizeof (v));
+  REPLY_MACRO (VL_API_CGNAT_SET_TIMEOUTS_REPLY);
+}
+
 #include <vnet/format_fns.h>
 #include <cgnat/cgnat.api.c>
 

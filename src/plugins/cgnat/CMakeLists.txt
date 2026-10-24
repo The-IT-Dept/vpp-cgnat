@@ -10,10 +10,12 @@ add_vpp_plugin(cgnat
   cgnat_cli.c
   cgnat_in2out.c
   cgnat_out2in.c
+  cgnat_expire.c
 
   MULTIARCH_SOURCES
   cgnat_in2out.c
   cgnat_out2in.c
+  cgnat_expire.c
 
   API_FILES
   cgnat.api

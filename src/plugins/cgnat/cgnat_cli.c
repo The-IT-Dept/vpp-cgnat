@@ -246,3 +246,54 @@ VLIB_CLI_COMMAND (cgnat_session_limit_command, static) = {
   .short_help = "cgnat sessions-per-subscriber <n>",
   .function = cgnat_session_limit_fn,
 };
+
+uword
+unformat_cgnat_timeouts (unformat_input_t *input, va_list *args)
+{
+  u32 *t = va_arg (*args, u32 *);
+  int n = 0;
+
+  while (unformat_check_input (input) != UNFORMAT_END_OF_INPUT)
+    {
+      if (unformat (input, "tcp-established %u", &t[CGNAT_TO_TCP_EST]))
+	;
+      else if (unformat (input, "tcp-transitory %u",
+			 &t[CGNAT_TO_TCP_TRANS]))
+	;
+      else if (unformat (input, "udp %u", &t[CGNAT_TO_UDP]))
+	;
+      else if (unformat (input, "icmp %u", &t[CGNAT_TO_ICMP]))
+	;
+      else
+	break;
+      n++;
+    }
+  return n > 0;
+}
+
+static clib_error_t *
+cgnat_timeouts_fn (vlib_main_t *vm, unformat_input_t *input,
+		   vlib_cli_command_t *cmd)
+{
+  cgnat_main_t *cm = &cgnat_main;
+  u32 t[CGNAT_N_TO];
+  int i;
+
+  clib_memcpy (t, cm->timeouts, sizeof (t));
+  if (!unformat (input, "%U", unformat_cgnat_timeouts, t) ||
+      unformat_check_input (input) != UNFORMAT_END_OF_INPUT)
+    return clib_error_return (0, "usage: cgnat timeouts [tcp-established <s>] "
+				 "[tcp-transitory <s>] [udp <s>] [icmp <s>]");
+  for (i = 0; i < CGNAT_N_TO; i++)
+    if (!t[i])
+      return clib_error_return (0, "timeouts must be > 0");
+  clib_memcpy (cm->timeouts, t, sizeof (t));
+  return 0;
+}
+
+VLIB_CLI_COMMAND (cgnat_timeouts_command, static) = {
+  .path = "cgnat timeouts",
+  .short_help = "cgnat timeouts [tcp-established <s>] [tcp-transitory <s>] "
+		"[udp <s>] [icmp <s>]",
+  .function = cgnat_timeouts_fn,
+};

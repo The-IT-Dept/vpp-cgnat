@@ -104,3 +104,15 @@ autoreply define cgnat_set_session_limit {
   u32 context;
   u32 per_subscriber;
 };
+
+/** \brief Session idle timeouts, seconds
+    (defaults: tcp_established 7440, tcp_transitory 240, udp 300, icmp 60)
+*/
+autoreply define cgnat_set_timeouts {
+  u32 client_index;
+  u32 context;
+  u32 tcp_established;
+  u32 tcp_transitory;
+  u32 udp;
+  u32 icmp;
+};
