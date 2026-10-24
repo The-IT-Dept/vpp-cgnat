@@ -112,7 +112,7 @@ different nodes, each node's table dumped over the API:
 | 100.64.0.1 | node 1 | 2 sessions, owned | the same 2, warm |
 | 100.64.0.6 | node 2 | the same 5, warm | 5 sessions, owned |
 
-Both nodes held the identical 7 sessions with the same public IP:port.
+Both nodes held the identical 7 sessions with the same public IP:port. Re-run on the final SR-IOV build: both nodes held the identical 4 sessions (2 for 100.64.0.1 owned on node 1, 2 for 100.64.0.6 owned on node 2), each owned on exactly one node and warm on the other.
 
 **Throughput in the VMs, measured on the production nodes.** A DPDK generator
 VM sent 64-byte UDP from 4096 subscribers × 63 flows through a test map, to a
