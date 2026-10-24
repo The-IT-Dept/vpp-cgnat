@@ -352,6 +352,30 @@ class TestCgnatTranslate(CgnatPgCase):
         self.assert_packet_checksums_valid(whole)
 
 
+class TestCgnatCli(VppTestCase):
+    """CGNAT CLI parsing"""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.create_loopback_interfaces(2)
+        cls.vapi.cli("set interface name %s inside" % cls.lo_interfaces[0].name)
+        cls.vapi.cli("set interface name %s outside" % cls.lo_interfaces[1].name)
+
+    def test_interface_names_starting_with_keywords(self):
+        """'set interface cgnat in inside' / 'out outside' work and can be undone"""
+        out = self.vapi.cli("set interface cgnat in inside")
+        self.assertNotIn("unknown input", out)
+        out = self.vapi.cli("set interface cgnat out outside")
+        self.assertNotIn("unknown input", out)
+        feats = self.vapi.cli("show interface features inside")
+        self.assertIn("cgnat-in2out", feats)
+        self.assertIn("cgnat-out2in", self.vapi.cli("show interface features outside"))
+        self.vapi.cli("set interface cgnat in inside del")
+        self.vapi.cli("set interface cgnat out outside del")
+        self.assertNotIn("cgnat-in2out", self.vapi.cli("show interface features inside"))
+
+
 class TestCgnatTranslateInsideTable(TestCgnatTranslate):
     """CGNAT translation with the inside interface in its own table (optional)"""
 

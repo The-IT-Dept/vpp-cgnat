@@ -136,17 +136,18 @@ set_interface_cgnat_fn (vlib_main_t *vm, unformat_input_t *input,
   u32 sw_if_index = ~0;
   int is_inside = -1, is_add = 1, rv;
 
+  /* "in"/"out" take the interface as their argument: matched as bare
+     keywords they would also match the start of names like "inside" */
   while (unformat_check_input (input) != UNFORMAT_END_OF_INPUT)
     {
-      if (unformat (input, "in"))
+      if (unformat (input, "in %U", unformat_vnet_sw_interface, vnm,
+		    &sw_if_index))
 	is_inside = 1;
-      else if (unformat (input, "out"))
+      else if (unformat (input, "out %U", unformat_vnet_sw_interface, vnm,
+			 &sw_if_index))
 	is_inside = 0;
       else if (unformat (input, "del"))
 	is_add = 0;
-      else if (unformat (input, "%U", unformat_vnet_sw_interface, vnm,
-			 &sw_if_index))
-	;
       else
 	return clib_error_return (0, "unknown input '%U'",
 				  format_unformat_error, input);
