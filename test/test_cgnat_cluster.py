@@ -656,6 +656,20 @@ class TestCgnatClusterSync(CgnatSteerHelpers):
         self.sleep(0.1)
         self.assertEqual(self.sessions(theirs[0]), [])
 
+    def test_show_sessions_marks_owned_and_warm(self):
+        """show cgnat sessions tags each session owned (ours) or warm (the peer's copy)"""
+        mine, theirs = self.split()
+        self.flow(mine[0], 7300)
+        f = self.vapi.cgnat_forward(in_vrf=0, in_addr=theirs[0])
+        rec = record(1, theirs[0], 7301, str(f.out_addr), f.port_lo + 1, self.pg1.remote_ip4, 53)
+        self.send_peer(self.sync_msg(0, [rec]))
+        self.sleep(0.1)
+        lines = [l for l in self.vapi.cli("show cgnat sessions").splitlines() if "thread" in l]
+        own = [l for l in lines if "%s:7300" % mine[0] in l]
+        warm = [l for l in lines if "%s:7301" % theirs[0] in l]
+        self.assertTrue(own and own[0].rstrip().endswith("owned"), lines)
+        self.assertTrue(warm and warm[0].rstrip().endswith("warm"), lines)
+
     def test_record_for_unknown_map_rejected(self):
         """A record for a map we don't have is rejected and counted"""
         mine, theirs = self.split()
@@ -811,7 +825,10 @@ class TestCgnatClusterFailover(TestCgnatClusterSync.__bases__[0]):
     sessions = TestCgnatClusterSync.sessions
 
     def rejoin(self, seconds, **hello):
-        """Re-enable the cluster (starting again) while the peer says hello."""
+        """Re-enable the cluster (starting again) while the peer says hello.
+        Like a real incumbent, the peer doesn't include us (no PEER_IN_ACTIVE)
+        while we aren't ready."""
+        hello.setdefault("state", READY)
         self.pg2.enable_capture()
         self.cluster_on(dead_interval_ms=self.dead_ms)
         self.keep_hello(seconds, **hello)

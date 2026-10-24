@@ -19,6 +19,8 @@ sleep 3
 NS srv ss -tnH state established "( sport = :5201 or sport = :5202 )" | awk '{print $4}' | sort > $OUT/tcp-before.txt
 vppctl_a show cgnat status > $OUT/a-before.txt; vppctl_b show cgnat status > $OUT/b-before.txt
 vppctl_a show cgnat lookup forward 100.64.0.10 > $OUT/forward-before.txt
+# dual sessions: both nodes' tables, a moment apart, while traffic flows
+vppctl_a show cgnat sessions > $OUT/a-sessions.txt; vppctl_b show cgnat sessions > $OUT/b-sessions.txt
 sleep $((K - 4))
 echo "$(date +%T) kill -9 B"; kill -9 $(cat $RUN/b.pid); KT=$(date +%s.%N)
 sleep 2; vppctl_a show cgnat cluster > $OUT/a-after-kill.txt
@@ -59,6 +61,24 @@ res("every udp flow kept one public ip:port", all(len(e) == 1 for e in eps), str
 loss = [f["sent"] - f["recv"] for f in u]; gaps = [round(f["max_gap"], 2) for f in u]
 res("udp loss per flow <= 40 packets (2 s x 2 events at 10 pps)", max(loss) <= 40, "loss %s" % loss)
 print("  udp max gap per flow (s):", gaps)
+def sessions(f):
+    out = {}
+    for l in open(f):
+        w = l.split()
+        if len(w) > 12 and w[0] == "thread":
+            # thread N proto in:port fib F -> out:port <-> remote:port class idle Ns owned|warm
+            out[(w[2], w[3], w[7], w[9])] = w[-1]
+    return out
+sa, sb = sessions(out + "/a-sessions.txt"), sessions(out + "/b-sessions.txt")
+common = set(sa) & set(sb)
+only = (set(sa) ^ set(sb))
+one_owner = all(sorted((sa[k], sb[k])) == ["owned", "warm"] for k in common)
+res("dual sessions: both nodes hold the same sessions (%d on A, %d on B, %d differ while flows churn)"
+    % (len(sa), len(sb), len(only)), len(common) >= 20 and len(only) <= max(2, len(common) // 20))
+res("dual sessions: every shared session is owned on exactly one node and warm on the other", one_owner,
+    str([(k, sa[k], sb[k]) for k in common if sorted((sa[k], sb[k])) != ["owned", "warm"]][:3]))
+res("dual sessions: both nodes own some (load shared)",
+    any(v == "owned" for v in sa.values()) and any(v == "owned" for v in sb.values()))
 res("mapping unchanged", open(out + "/forward-before.txt").read() == open(out + "/forward-after.txt").read())
 def steered(f):
     for l in open(f):

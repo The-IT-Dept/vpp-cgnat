@@ -203,14 +203,15 @@ show_cgnat_sessions_fn (vlib_main_t *vm, unformat_input_t *input,
 	    continue;
 	  vlib_cli_output (
 	    vm,
-	    "thread %u %s %U:%u fib %u -> %U:%u <-> %U:%u %s idle %.0fs",
+	    "thread %u %s %U:%u fib %u -> %U:%u <-> %U:%u %s idle %.0fs %s",
 	    t - cm->per_thread, cgnat_proto_names[m->proto],
 	    format_ip4_address, &m->in_addr,
 	    clib_net_to_host_u16 (m->in_port), m->in_fib_index,
 	    format_ip4_address, &m->out_addr,
 	    clib_net_to_host_u16 (m->out_port), format_ip4_address,
 	    &s->remote_addr, clib_net_to_host_u16 (s->remote_port),
-	    cgnat_class_names[s->to_class], now - s->last_heard);
+	    cgnat_class_names[s->to_class], now - s->last_heard,
+	    s->warm ? "warm" : "owned");
 	}
     }
   return 0;
