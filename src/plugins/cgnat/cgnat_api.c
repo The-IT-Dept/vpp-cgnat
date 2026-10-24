@@ -124,6 +124,33 @@ vl_api_cgnat_interface_add_del_feature_t_handler (
   REPLY_MACRO (VL_API_CGNAT_INTERFACE_ADD_DEL_FEATURE_REPLY);
 }
 
+static void
+vl_api_cgnat_set_filtering_t_handler (vl_api_cgnat_set_filtering_t *mp)
+{
+  cgnat_main_t *cm = &cgnat_main;
+  vl_api_cgnat_set_filtering_reply_t *rmp;
+  int rv = 0;
+
+  cm->endpoint_independent_filtering = mp->endpoint_independent;
+  REPLY_MACRO (VL_API_CGNAT_SET_FILTERING_REPLY);
+}
+
+static void
+vl_api_cgnat_set_session_limit_t_handler (
+  vl_api_cgnat_set_session_limit_t *mp)
+{
+  cgnat_main_t *cm = &cgnat_main;
+  vl_api_cgnat_set_session_limit_reply_t *rmp;
+  u32 limit = ntohl (mp->per_subscriber);
+  int rv = 0;
+
+  if (limit == 0)
+    rv = VNET_API_ERROR_INVALID_VALUE;
+  else
+    cm->sessions_per_sub = limit;
+  REPLY_MACRO (VL_API_CGNAT_SET_SESSION_LIMIT_REPLY);
+}
+
 #include <vnet/format_fns.h>
 #include <cgnat/cgnat.api.c>
 

@@ -321,5 +321,80 @@ class TestCgnatTranslate(CgnatPgCase):
         self.assert_packet_checksums_valid(whole)
 
 
+class TestCgnatPolicy(CgnatPgCase):
+    """CGNAT policy: filtering, port collisions, session cap"""
+
+    def tearDown(self):
+        if not self.vpp_dead:
+            self.vapi.cgnat_set_filtering(endpoint_independent=0)
+            self.vapi.cgnat_set_session_limit(per_subscriber=1000)
+        super().tearDown()
+
+    def test_address_dependent_blocks_new_remote(self):
+        """Address-dependent filtering: unknown remote dropped, known remote any port allowed"""
+        h = self.host()
+        r1, r2 = self.pg1.remote_hosts[0].ip4, self.pg1.remote_hosts[1].ip4
+        rx = self.in2out(h, 7100, r1, 1000)
+        out, port = rx[IP].src, rx[UDP].sport
+        before = self.err("cgnat-out2in", "filtered")
+        self.send_and_assert_no_replies(
+            self.pg1, [self.out_pkt(r2, 1000, out, port)], remark="r2 filtered"
+        )
+        self.assertEqual(self.err("cgnat-out2in", "filtered") - before, 1)
+        self.out2in_ok(self.out_pkt(r1, 1001, out, port), h, 7100)
+
+    def test_endpoint_independent_allows_any(self):
+        """Endpoint-independent filtering lets any remote reach a live mapping"""
+        self.vapi.cgnat_set_filtering(endpoint_independent=1)
+        h = self.host()
+        r1, r2 = self.pg1.remote_hosts[0].ip4, self.pg1.remote_hosts[1].ip4
+        rx = self.in2out(h, 7200, r1, 1000)
+        self.out2in_ok(self.out_pkt(r2, 4321, rx[IP].src, rx[UDP].sport), h, 7200)
+
+    def test_collision_probes_within_block(self):
+        """Inside ports with the same first choice get different ports in the block"""
+        h = self.host()
+        out, lo, hi = self.block(h)
+        n = hi - lo + 1
+        a = self.in2out(h, 1000, self.pg1.remote_ip4, 53)
+        b = self.in2out(h, 1000 + n, self.pg1.remote_ip4, 53)
+        self.assertEqual(a[UDP].sport, lo + 1000 % n)
+        self.assertNotEqual(a[UDP].sport, b[UDP].sport)
+        for p in (a, b):
+            self.assertEqual(p[IP].src, out)
+            self.assertTrue(lo <= p[UDP].sport <= hi)
+
+    def test_session_cap(self):
+        """Per-subscriber session cap: the 4th session of a capped subscriber is dropped"""
+        self.vapi.cgnat_set_session_limit(per_subscriber=3)
+        a, b = self.host(0), self.host(1)
+        for sport in (9001, 9002, 9003):
+            self.in2out(a, sport, self.pg1.remote_ip4, 53)
+        before = self.err("cgnat-in2out", "cap")
+        p = self.in_pkt(a, 9004, self.pg1.remote_ip4, 53)
+        self.send_and_assert_no_replies(self.pg0, [p], remark="over cap")
+        self.assertEqual(self.err("cgnat-in2out", "cap") - before, 1)
+        self.in2out(b, 9004, self.pg1.remote_ip4, 53)
+
+
+class TestCgnatExhaust(CgnatPgCase):
+    """CGNAT port block exhaustion (/24 -> /32: 252 ports per subscriber)"""
+
+    pool_plen = 32
+
+    def test_block_exhausted(self):
+        """The 253rd distinct inside port of a subscriber is dropped (exhausted)"""
+        h = self.host()
+        out, lo, hi = self.block(h)
+        self.assertEqual(hi - lo + 1, 252)
+        pkts = [self.in_pkt(h, 20000 + i, self.pg1.remote_ip4, 53) for i in range(252)]
+        rx = self.send_and_expect(self.pg0, pkts, self.pg1)
+        self.assertEqual(len({p[UDP].sport for p in rx}), 252)
+        before = self.err("cgnat-in2out", "exhausted")
+        p = self.in_pkt(h, 30000, self.pg1.remote_ip4, 53)
+        self.send_and_assert_no_replies(self.pg0, [p], remark="exhausted")
+        self.assertEqual(self.err("cgnat-in2out", "exhausted") - before, 1)
+
+
 if __name__ == "__main__":
     unittest.main(testRunner=VppTestRunner)

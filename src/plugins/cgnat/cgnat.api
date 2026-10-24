@@ -87,3 +87,20 @@ autoreply define cgnat_interface_add_del_feature {
   bool is_inside;
   vl_api_interface_index_t sw_if_index;
 };
+
+/** \brief Inbound filtering for live mappings
+    @param endpoint_independent - any remote may reach a mapping if true;
+           if false (default) only remote addresses the mapping has talked to
+*/
+autoreply define cgnat_set_filtering {
+  u32 client_index;
+  u32 context;
+  bool endpoint_independent;
+};
+
+/** \brief Maximum sessions per subscriber (default 1000) */
+autoreply define cgnat_set_session_limit {
+  u32 client_index;
+  u32 context;
+  u32 per_subscriber;
+};

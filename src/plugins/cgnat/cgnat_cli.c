@@ -205,3 +205,44 @@ VLIB_CLI_COMMAND (show_cgnat_sessions_command, static) = {
   .short_help = "show cgnat sessions",
   .function = show_cgnat_sessions_fn,
 };
+
+static clib_error_t *
+cgnat_filtering_fn (vlib_main_t *vm, unformat_input_t *input,
+		    vlib_cli_command_t *cmd)
+{
+  cgnat_main_t *cm = &cgnat_main;
+
+  if (unformat (input, "endpoint-independent"))
+    cm->endpoint_independent_filtering = 1;
+  else if (unformat (input, "address-dependent"))
+    cm->endpoint_independent_filtering = 0;
+  else
+    return clib_error_return (0, "usage: cgnat filtering "
+				 "address-dependent|endpoint-independent");
+  return 0;
+}
+
+VLIB_CLI_COMMAND (cgnat_filtering_command, static) = {
+  .path = "cgnat filtering",
+  .short_help = "cgnat filtering address-dependent|endpoint-independent",
+  .function = cgnat_filtering_fn,
+};
+
+static clib_error_t *
+cgnat_session_limit_fn (vlib_main_t *vm, unformat_input_t *input,
+			vlib_cli_command_t *cmd)
+{
+  cgnat_main_t *cm = &cgnat_main;
+  u32 n;
+
+  if (!unformat (input, "%u", &n) || n == 0)
+    return clib_error_return (0, "usage: cgnat sessions-per-subscriber <n>");
+  cm->sessions_per_sub = n;
+  return 0;
+}
+
+VLIB_CLI_COMMAND (cgnat_session_limit_command, static) = {
+  .path = "cgnat sessions-per-subscriber",
+  .short_help = "cgnat sessions-per-subscriber <n>",
+  .function = cgnat_session_limit_fn,
+};
