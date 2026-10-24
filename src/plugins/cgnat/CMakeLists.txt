@@ -4,4 +4,10 @@
 add_vpp_plugin(cgnat
   SOURCES
   cgnat.c
+  cgnat_map.c
+  cgnat_api.c
+  cgnat_cli.c
+
+  API_FILES
+  cgnat.api
 )

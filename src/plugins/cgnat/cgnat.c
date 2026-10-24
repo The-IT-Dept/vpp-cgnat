@@ -14,9 +14,10 @@ cgnat_init (vlib_main_t *vm)
 {
   cgnat_main_t *cm = &cgnat_main;
 
-  clib_memset (cm, 0, sizeof (*cm));
   cm->vlib_main = vm;
   cm->vnet_main = vnet_get_main ();
+  cm->fib_src = fib_source_allocate ("cgnat", FIB_SOURCE_PRIORITY_HI,
+				     FIB_SOURCE_BH_SIMPLE);
   return 0;
 }
 

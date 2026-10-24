@@ -1,0 +1,76 @@
+/*
+ * SPDX-License-Identifier: Apache-2.0
+ * Copyright (c) 2026 The vpp-cgnat authors
+ */
+
+option version = "0.1.0";
+import "vnet/ip/ip_types.api";
+import "vnet/interface_types.api";
+
+/** \brief Add or delete a deterministic map (inside prefix -> outside pool)
+    @param is_add - add if true, delete if false
+    @param in_vrf - inside table id
+    @param in_addr / in_plen - inside prefix
+    @param out_vrf - outside table id
+    @param out_addr / out_plen - outside pool prefix
+*/
+autoreply define cgnat_map_add_del {
+  u32 client_index;
+  u32 context;
+  bool is_add;
+  u32 in_vrf;
+  vl_api_ip4_address_t in_addr;
+  u8 in_plen;
+  u32 out_vrf;
+  vl_api_ip4_address_t out_addr;
+  u8 out_plen;
+};
+
+define cgnat_map_dump {
+  u32 client_index;
+  u32 context;
+};
+
+define cgnat_map_details {
+  u32 context;
+  u32 in_vrf;
+  vl_api_ip4_address_t in_addr;
+  u8 in_plen;
+  u32 out_vrf;
+  vl_api_ip4_address_t out_addr;
+  u8 out_plen;
+  u32 ratio;
+  u16 ports_per_sub;
+};
+
+/** \brief Subscriber -> outside address and port block */
+define cgnat_forward {
+  u32 client_index;
+  u32 context;
+  u32 in_vrf;
+  vl_api_ip4_address_t in_addr;
+};
+
+define cgnat_forward_reply {
+  u32 context;
+  i32 retval;
+  vl_api_ip4_address_t out_addr;
+  u16 port_lo;
+  u16 port_hi;
+};
+
+/** \brief Outside address:port -> subscriber */
+define cgnat_reverse {
+  u32 client_index;
+  u32 context;
+  u32 out_vrf;
+  vl_api_ip4_address_t out_addr;
+  u16 out_port;
+};
+
+define cgnat_reverse_reply {
+  u32 context;
+  i32 retval;
+  u32 in_vrf;
+  vl_api_ip4_address_t in_addr;
+};
