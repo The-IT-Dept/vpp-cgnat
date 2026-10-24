@@ -99,9 +99,10 @@ cgnat_out2in_icmp_error (vlib_main_t *vm, vlib_node_runtime_t *node,
 }
 
 static_always_inline u32
-cgnat_out2in_one (vlib_main_t *vm, vlib_node_runtime_t *node, cgnat_per_thread_t *t,
-		  u32 thread_index, vlib_buffer_t *b, f64 now,
-		  cgnat_mapping_t **mp, cgnat_session_t **sp)
+cgnat_out2in_one (vlib_main_t *vm, vlib_node_runtime_t *node,
+		  cgnat_per_thread_t *t, u32 thread_index, vlib_buffer_t *b,
+		  f64 now, cgnat_mapping_t **mp, cgnat_session_t **sp,
+		  int is_hairpin)
 {
   cgnat_main_t *cm = &cgnat_main;
   ip4_header_t *ip = vlib_buffer_get_current (b);
@@ -113,11 +114,13 @@ cgnat_out2in_one (vlib_main_t *vm, vlib_node_runtime_t *node, cgnat_per_thread_t
   cgnat_sub_t *sub;
   u8 proto;
 
-  rx_fib = ip4_fib_table_get_index_for_sw_if_index (
-    vnet_buffer (b)->sw_if_index[VLIB_RX]);
+  /* hairpinned packets were translated by in2out into the outside fib */
+  rx_fib = is_hairpin ? vnet_buffer (b)->sw_if_index[VLIB_TX] :
+			ip4_fib_table_get_index_for_sw_if_index (
+			  vnet_buffer (b)->sw_if_index[VLIB_RX]);
 
   /* not addressed to a pool: not ours */
-  if (!cgnat_map_by_outside (rx_fib, &ip->dst_address))
+  if (!is_hairpin && !cgnat_map_by_outside (rx_fib, &ip->dst_address))
     {
       vnet_feature_next (&next, b);
       return next;
@@ -181,8 +184,9 @@ cgnat_out2in_one (vlib_main_t *vm, vlib_node_runtime_t *node, cgnat_per_thread_t
   return CGNAT_OUT2IN_NEXT_LOOKUP;
 }
 
-VLIB_NODE_FN (cgnat_out2in_node)
-(vlib_main_t *vm, vlib_node_runtime_t *node, vlib_frame_t *frame)
+static_always_inline uword
+cgnat_out2in_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
+		     vlib_frame_t *frame, int is_hairpin)
 {
   cgnat_main_t *cm = &cgnat_main;
   u32 thread_index = vm->thread_index;
@@ -199,7 +203,8 @@ VLIB_NODE_FN (cgnat_out2in_node)
       cgnat_mapping_t *m = 0;
       cgnat_session_t *s = 0;
 
-      next[0] = cgnat_out2in_one (vm, node, t, thread_index, b[0], now, &m, &s);
+      next[0] = cgnat_out2in_one (vm, node, t, thread_index, b[0], now, &m, &s,
+				  is_hairpin);
       if (PREDICT_FALSE (b[0]->flags & VLIB_BUFFER_IS_TRACED))
 	{
 	  cgnat_out2in_trace_t *tr =
@@ -216,6 +221,32 @@ VLIB_NODE_FN (cgnat_out2in_node)
   vlib_buffer_enqueue_to_next (vm, node, from, nexts, frame->n_vectors);
   return frame->n_vectors;
 }
+
+VLIB_NODE_FN (cgnat_out2in_node)
+(vlib_main_t *vm, vlib_node_runtime_t *node, vlib_frame_t *frame)
+{
+  return cgnat_out2in_inline (vm, node, frame, 0);
+}
+
+VLIB_NODE_FN (cgnat_hairpin_node)
+(vlib_main_t *vm, vlib_node_runtime_t *node, vlib_frame_t *frame)
+{
+  return cgnat_out2in_inline (vm, node, frame, 1);
+}
+
+VLIB_REGISTER_NODE (cgnat_hairpin_node) = {
+  .name = "cgnat-hairpin",
+  .vector_size = sizeof (u32),
+  .format_trace = format_cgnat_out2in_trace,
+  .type = VLIB_NODE_TYPE_INTERNAL,
+  .n_errors = CGNAT_OUT2IN_N_ERROR,
+  .error_counters = cgnat_out2in_error_counters,
+  .n_next_nodes = CGNAT_OUT2IN_N_NEXT,
+  .next_nodes = {
+    [CGNAT_OUT2IN_NEXT_LOOKUP] = "ip4-lookup",
+    [CGNAT_OUT2IN_NEXT_DROP] = "error-drop",
+  },
+};
 
 VLIB_REGISTER_NODE (cgnat_out2in_node) = {
   .name = "cgnat-out2in",

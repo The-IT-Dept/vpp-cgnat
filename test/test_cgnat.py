@@ -475,5 +475,32 @@ class TestCgnatIcmp(CgnatPgCase):
         self.assert_packet_checksums_valid(rx)
 
 
+class TestCgnatHairpin(CgnatPgCase):
+    """CGNAT hairpinning between subscribers"""
+
+    def tearDown(self):
+        if not self.vpp_dead:
+            self.vapi.cgnat_set_filtering(endpoint_independent=0)
+        super().tearDown()
+
+    def test_hairpin_between_subscribers(self):
+        """A reaches B via B's public ip:port; B sees A's public ip:port"""
+        self.vapi.cgnat_set_filtering(endpoint_independent=1)
+        a, b = self.host(0), self.host(1)
+        rx = self.in2out(b, 7000, self.pg1.remote_ip4, 80)
+        out_b, port_b = rx[IP].src, rx[UDP].sport
+        p = self.in_pkt(a, 7500, out_b, port_b)
+        rx = self.send_and_expect(self.pg0, [p], self.pg0)[0]
+        out_a, port_a = self.first_choice(a, 7500)
+        self.assertEqual((rx[IP].dst, rx[UDP].dport), (b, 7000))
+        self.assertEqual((rx[IP].src, rx[UDP].sport), (out_a, port_a))
+        self.assert_packet_checksums_valid(rx)
+        # and B's reply hairpins back to A
+        p = self.in_pkt(b, 7000, out_a, port_a)
+        rx = self.send_and_expect(self.pg0, [p], self.pg0)[0]
+        self.assertEqual((rx[IP].dst, rx[UDP].dport), (a, 7500))
+        self.assertEqual((rx[IP].src, rx[UDP].sport), (out_b, port_b))
+
+
 if __name__ == "__main__":
     unittest.main(testRunner=VppTestRunner)

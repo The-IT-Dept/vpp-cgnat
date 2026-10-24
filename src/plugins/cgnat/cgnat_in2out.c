@@ -38,6 +38,7 @@ typedef enum
   CGNAT_IN2OUT_NEXT_LOOKUP,
   CGNAT_IN2OUT_NEXT_DROP,
   CGNAT_IN2OUT_NEXT_ICMP_ERROR,
+  CGNAT_IN2OUT_NEXT_HAIRPIN,
   CGNAT_IN2OUT_N_NEXT,
 } cgnat_in2out_next_t;
 
@@ -206,6 +207,10 @@ cgnat_in2out_one (vlib_main_t *vm, vlib_node_runtime_t *node, cgnat_per_thread_t
   vnet_buffer (b)->sw_if_index[VLIB_TX] = m->out_fib_index;
   *mp = m;
   *sp = s;
+  /* to another subscriber's public address: translate it back in */
+  if (PREDICT_FALSE (cgnat_map_by_outside (m->out_fib_index,
+					   &ip->dst_address) != 0))
+    return CGNAT_IN2OUT_NEXT_HAIRPIN;
   return CGNAT_IN2OUT_NEXT_LOOKUP;
 
 pass:
@@ -261,6 +266,7 @@ VLIB_REGISTER_NODE (cgnat_in2out_node) = {
     [CGNAT_IN2OUT_NEXT_LOOKUP] = "ip4-lookup",
     [CGNAT_IN2OUT_NEXT_DROP] = "error-drop",
     [CGNAT_IN2OUT_NEXT_ICMP_ERROR] = "ip4-icmp-error",
+    [CGNAT_IN2OUT_NEXT_HAIRPIN] = "cgnat-hairpin",
   },
 };
 
