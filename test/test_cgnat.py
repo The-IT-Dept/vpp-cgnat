@@ -5,8 +5,13 @@
 import ipaddress
 import unittest
 
+from scapy.layers.inet import ICMP, IP, TCP, UDP, IPerror, UDPerror, fragment
+from scapy.layers.l2 import Ether
+from scapy.packet import Raw
+
 from framework import VppTestCase
 from asfframework import VppTestRunner
+from util import reassemble4
 
 
 class TestCgnatPlugin(VppTestCase):
@@ -123,6 +128,197 @@ class TestCgnatMap(VppTestCase):
         self.assertEqual(len(self.vapi.cgnat_map_dump()), 0)
         with self.vapi.assert_negative_api_retval():
             self.fwd("100.64.0.5")
+
+
+class CgnatPgCase(VppTestCase):
+    """Shared topology: pg0 inside (VRF 1), pg1 outside (VRF 0).
+
+    Map: pg0's subnet 172.16.1.0/24 (inside VRF 1) -> 192.0.2.0/30 (VRF 0),
+    ratio 64, 1008 ports per subscriber.
+    """
+
+    in_vrf = 1
+    pool = "192.0.2.0"
+    pool_plen = 30
+    n_inside_hosts = 4
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.create_pg_interfaces(range(2))
+        # class-lifetime table: kept out of the per-test object registry
+        cls.vapi.ip_table_add_del_v2(is_add=1, table={"table_id": cls.in_vrf})
+        cls.pg0.set_table_ip4(cls.in_vrf)
+        for i in cls.pg_interfaces:
+            i.admin_up()
+            i.config_ip4()
+            i.resolve_arp()
+        cls.pg0.generate_remote_hosts(cls.n_inside_hosts + 1)
+        cls.pg0.configure_ipv4_neighbors()
+        cls.pg1.generate_remote_hosts(3)
+        cls.pg1.configure_ipv4_neighbors()
+
+    @classmethod
+    def tearDownClass(cls):
+        for i in cls.pg_interfaces:
+            i.unconfig_ip4()
+            i.set_table_ip4(0)
+            i.admin_down()
+        cls.vapi.ip_table_add_del_v2(is_add=0, table={"table_id": cls.in_vrf})
+        super().tearDownClass()
+
+    def setUp(self):
+        super().setUp()
+        self.vapi.cgnat_map_add_del(
+            is_add=1,
+            in_vrf=self.in_vrf,
+            in_addr=self.inside_net(),
+            in_plen=24,
+            out_vrf=0,
+            out_addr=self.pool,
+            out_plen=self.pool_plen,
+        )
+        self.vapi.cgnat_interface_add_del_feature(
+            is_add=1, is_inside=1, sw_if_index=self.pg0.sw_if_index
+        )
+        self.vapi.cgnat_interface_add_del_feature(
+            is_add=1, is_inside=0, sw_if_index=self.pg1.sw_if_index
+        )
+
+    def tearDown(self):
+        if not self.vpp_dead:
+            self.logger.info(self.vapi.cli("show cgnat sessions"))
+            self.vapi.cgnat_interface_add_del_feature(
+                is_add=0, is_inside=1, sw_if_index=self.pg0.sw_if_index
+            )
+            self.vapi.cgnat_interface_add_del_feature(
+                is_add=0, is_inside=0, sw_if_index=self.pg1.sw_if_index
+            )
+            clear_cgnat(self)
+        super().tearDown()
+
+    # helpers
+
+    def inside_net(self):
+        return str(ipaddress.ip_network(self.pg0.local_ip4 + "/24", strict=False).network_address)
+
+    def host(self, i=0):
+        """i-th inside subscriber address (remote hosts start at .2)"""
+        return self.pg0.remote_hosts[i + 1].ip4
+
+    def block(self, in_addr):
+        f = self.vapi.cgnat_forward(in_vrf=self.in_vrf, in_addr=in_addr)
+        return str(f.out_addr), f.port_lo, f.port_hi
+
+    def first_choice(self, in_addr, in_port):
+        out, lo, hi = self.block(in_addr)
+        return out, lo + in_port % (hi - lo + 1)
+
+    def err(self, node, name):
+        return self.statistics.get_err_counter("/err/%s/%s" % (node, name))
+
+    def in_pkt(self, src, sport, dst, dport, proto=UDP, payload=b"x" * 16, **kw):
+        l4 = proto(sport=sport, dport=dport, **kw)
+        return (
+            Ether(src=self.pg0.remote_mac, dst=self.pg0.local_mac)
+            / IP(src=src, dst=dst)
+            / l4
+            / Raw(payload)
+        )
+
+    def out_pkt(self, src, sport, dst, dport, proto=UDP, payload=b"y" * 16, **kw):
+        l4 = proto(sport=sport, dport=dport, **kw)
+        return (
+            Ether(src=self.pg1.remote_mac, dst=self.pg1.local_mac)
+            / IP(src=src, dst=dst)
+            / l4
+            / Raw(payload)
+        )
+
+    def out2in_ok(self, pkt, in_addr, in_port):
+        rx = self.send_and_expect(self.pg1, [pkt], self.pg0)[0]
+        self.assertEqual(rx[IP].dst, in_addr)
+        self.assertEqual(rx[IP].payload.dport, in_port)
+        self.assert_packet_checksums_valid(rx)
+        return rx
+
+    def in2out(self, src, sport, dst, dport, proto=UDP, **kw):
+        rx = self.send_and_expect(
+            self.pg0, [self.in_pkt(src, sport, dst, dport, proto, **kw)], self.pg1
+        )[0]
+        self.assert_packet_checksums_valid(rx)
+        return rx
+
+
+class TestCgnatTranslate(CgnatPgCase):
+    """CGNAT translation: UDP/TCP, EIM, drops, fragments"""
+
+    def test_udp_out_and_back(self):
+        """UDP translated out with the det44 first-choice port, reply restored"""
+        h = self.host()
+        rx = self.in2out(h, 5000, self.pg1.remote_ip4, 53)
+        out, port = self.first_choice(h, 5000)
+        self.assertEqual((rx[IP].src, rx[UDP].sport), (out, port))
+        self.assertEqual((rx[IP].dst, rx[UDP].dport), (self.pg1.remote_ip4, 53))
+        self.out2in_ok(self.out_pkt(self.pg1.remote_ip4, 53, out, port), h, 5000)
+
+    def test_tcp_out_and_back(self):
+        """TCP handshake through the NAT, both directions"""
+        h = self.host()
+        r = self.pg1.remote_ip4
+        rx = self.in2out(h, 6000, r, 80, TCP, flags="S")
+        out, port = self.first_choice(h, 6000)
+        self.assertEqual((rx[IP].src, rx[TCP].sport), (out, port))
+        self.out2in_ok(self.out_pkt(r, 80, out, port, TCP, flags="SA"), h, 6000)
+        rx = self.in2out(h, 6000, r, 80, TCP, flags="A")
+        self.assertEqual(rx[TCP].sport, port)
+
+    def test_eim_same_port_any_dest(self):
+        """Endpoint-independent mapping: same inside ip:port, two remotes, one outside port"""
+        h = self.host()
+        a = self.in2out(h, 7000, self.pg1.remote_hosts[0].ip4, 1000)
+        b = self.in2out(h, 7000, self.pg1.remote_hosts[1].ip4, 2000)
+        self.assertEqual((a[IP].src, a[UDP].sport), (b[IP].src, b[UDP].sport))
+
+    def test_unmapped_inside_dropped(self):
+        """Inside source in no map is dropped (no-map), never forwarded untranslated"""
+        before = self.err("cgnat-in2out", "no-map")
+        p = self.in_pkt("10.9.9.9", 1234, self.pg1.remote_ip4, 53)
+        self.send_and_assert_no_replies(self.pg0, [p], remark="unmapped")
+        self.assertEqual(self.err("cgnat-in2out", "no-map") - before, 1)
+
+    def test_unsolicited_inbound_dropped(self):
+        """Inbound to a pool ip:port with no mapping is dropped and creates no state"""
+        before = self.err("cgnat-out2in", "no-mapping")
+        p = self.out_pkt(self.pg1.remote_ip4, 4444, "192.0.2.1", 2000)
+        self.send_and_assert_no_replies(self.pg1, [p], remark="unsolicited")
+        self.assertEqual(self.err("cgnat-out2in", "no-mapping") - before, 1)
+        self.assertNotIn("192.0.2.1", self.vapi.cli("show cgnat sessions"))
+
+    def test_non_pool_outside_passes(self):
+        """Outside traffic not addressed to the pool is untouched (e.g. to VPP itself)"""
+        p = (
+            Ether(src=self.pg1.remote_mac, dst=self.pg1.local_mac)
+            / IP(src=self.pg1.remote_ip4, dst=self.pg1.local_ip4)
+            / ICMP(type="echo-request", id=7)
+        )
+        rx = self.send_and_expect(self.pg1, [p], self.pg1)[0]
+        self.assertEqual(rx[ICMP].type, 0)
+
+    def test_fragments_translated(self):
+        """Fragmented UDP: every fragment is translated consistently"""
+        h = self.host()
+        payload = bytes(range(256)) * 12  # 3072 bytes
+        p = self.in_pkt(h, 8000, self.pg1.remote_ip4, 9000, payload=payload)
+        frags = fragment(p, fragsize=1000)
+        rx = self.send_and_expect(self.pg0, frags, self.pg1, n_rx=len(frags))
+        out, port = self.first_choice(h, 8000)
+        for f in rx:
+            self.assertEqual(f[IP].src, out)
+        whole = reassemble4(rx)
+        self.assertEqual((whole[UDP].sport, whole[UDP].dport), (port, 9000))
+        self.assertEqual(bytes(whole[Raw]), payload)
+        self.assert_packet_checksums_valid(whole)
 
 
 if __name__ == "__main__":

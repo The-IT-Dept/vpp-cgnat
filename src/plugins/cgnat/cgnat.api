@@ -74,3 +74,16 @@ define cgnat_reverse_reply {
   u32 in_vrf;
   vl_api_ip4_address_t in_addr;
 };
+
+/** \brief Enable/disable translation on an interface
+    @param is_add - enable if true
+    @param is_inside - inside (subscriber side) if true, else outside
+    @param sw_if_index - interface
+*/
+autoreply define cgnat_interface_add_del_feature {
+  u32 client_index;
+  u32 context;
+  bool is_add;
+  bool is_inside;
+  vl_api_interface_index_t sw_if_index;
+};

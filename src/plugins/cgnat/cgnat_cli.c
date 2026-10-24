@@ -5,6 +5,7 @@
 
 #include <vnet/fib/fib_table.h>
 #include <cgnat/cgnat.h>
+#include <cgnat/cgnat_session.h>
 
 static clib_error_t *
 cgnat_map_command_fn (vlib_main_t *vm, unformat_input_t *input,
@@ -125,4 +126,82 @@ VLIB_CLI_COMMAND (show_cgnat_lookup_command, static) = {
   .short_help = "show cgnat lookup forward <addr> [inside-vrf <n>] | "
 		"reverse <addr>:<port> [outside-vrf <n>]",
   .function = show_cgnat_lookup_fn,
+};
+
+static clib_error_t *
+set_interface_cgnat_fn (vlib_main_t *vm, unformat_input_t *input,
+			vlib_cli_command_t *cmd)
+{
+  vnet_main_t *vnm = vnet_get_main ();
+  u32 sw_if_index = ~0;
+  int is_inside = -1, is_add = 1, rv;
+
+  while (unformat_check_input (input) != UNFORMAT_END_OF_INPUT)
+    {
+      if (unformat (input, "in"))
+	is_inside = 1;
+      else if (unformat (input, "out"))
+	is_inside = 0;
+      else if (unformat (input, "del"))
+	is_add = 0;
+      else if (unformat (input, "%U", unformat_vnet_sw_interface, vnm,
+			 &sw_if_index))
+	;
+      else
+	return clib_error_return (0, "unknown input '%U'",
+				  format_unformat_error, input);
+    }
+  if (is_inside < 0 || sw_if_index == ~0)
+    return clib_error_return (0, "usage: set interface cgnat in|out "
+				 "<interface> [del]");
+  rv = cgnat_interface_add_del (sw_if_index, is_inside, is_add);
+  if (rv)
+    return clib_error_return (0, "failed: %U", format_vnet_api_errno, rv);
+  return 0;
+}
+
+VLIB_CLI_COMMAND (set_interface_cgnat_command, static) = {
+  .path = "set interface cgnat",
+  .short_help = "set interface cgnat in|out <interface> [del]",
+  .function = set_interface_cgnat_fn,
+};
+
+static char *cgnat_proto_names[] = { "udp", "tcp", "icmp" };
+static char *cgnat_class_names[] = { "tcp-established", "tcp-transitory",
+				     "udp", "icmp" };
+
+static clib_error_t *
+show_cgnat_sessions_fn (vlib_main_t *vm, unformat_input_t *input,
+			vlib_cli_command_t *cmd)
+{
+  cgnat_main_t *cm = &cgnat_main;
+  f64 now = vlib_time_now (vm);
+  cgnat_per_thread_t *t;
+
+  vec_foreach (t, cm->per_thread)
+    {
+      cgnat_session_t *s;
+
+      pool_foreach (s, t->sessions_pool)
+	{
+	  cgnat_mapping_t *m = pool_elt_at_index (t->mappings, s->mapping_index);
+	  vlib_cli_output (
+	    vm,
+	    "thread %u %s %U:%u fib %u -> %U:%u <-> %U:%u %s idle %.0fs",
+	    t - cm->per_thread, cgnat_proto_names[m->proto],
+	    format_ip4_address, &m->in_addr,
+	    clib_net_to_host_u16 (m->in_port), m->in_fib_index,
+	    format_ip4_address, &m->out_addr,
+	    clib_net_to_host_u16 (m->out_port), format_ip4_address,
+	    &s->remote_addr, clib_net_to_host_u16 (s->remote_port),
+	    cgnat_class_names[s->to_class], now - s->last_heard);
+	}
+    }
+  return 0;
+}
+
+VLIB_CLI_COMMAND (show_cgnat_sessions_command, static) = {
+  .path = "show cgnat sessions",
+  .short_help = "show cgnat sessions",
+  .function = show_cgnat_sessions_fn,
 };

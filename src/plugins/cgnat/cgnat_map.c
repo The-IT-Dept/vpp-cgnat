@@ -83,6 +83,7 @@ cgnat_map_add_del (u32 in_table_id, ip4_address_t *in_pfx, u8 in_plen,
 	      m->out_base.as_u32 == out_base.as_u32)
 	    {
 	      u32 mi = m - cm->maps;
+	      cgnat_map_flush (mi);
 	      index_del (cm->maps_by_in_fib, m->in_fib_index, mi);
 	      index_del (cm->maps_by_out_fib, m->out_fib_index, mi);
 	      fib_table_unlock (m->in_fib_index, FIB_PROTOCOL_IP4,

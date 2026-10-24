@@ -109,6 +109,21 @@ vl_api_cgnat_reverse_t_handler (vl_api_cgnat_reverse_t *mp)
 		}));
 }
 
+static void
+vl_api_cgnat_interface_add_del_feature_t_handler (
+  vl_api_cgnat_interface_add_del_feature_t *mp)
+{
+  cgnat_main_t *cm = &cgnat_main;
+  vl_api_cgnat_interface_add_del_feature_reply_t *rmp;
+  int rv = 0;
+
+  VALIDATE_SW_IF_INDEX (mp);
+  rv = cgnat_interface_add_del (ntohl (mp->sw_if_index), mp->is_inside,
+				mp->is_add);
+  BAD_SW_IF_INDEX_LABEL;
+  REPLY_MACRO (VL_API_CGNAT_INTERFACE_ADD_DEL_FEATURE_REPLY);
+}
+
 #include <vnet/format_fns.h>
 #include <cgnat/cgnat.api.c>
 

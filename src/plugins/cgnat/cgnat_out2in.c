@@ -1,0 +1,192 @@
+/*
+ * SPDX-License-Identifier: Apache-2.0
+ * Copyright (c) 2026 The vpp-cgnat authors
+ */
+
+#include <vlib/vlib.h>
+#include <vnet/vnet.h>
+#include <vnet/feature/feature.h>
+#include <cgnat/cgnat.h>
+#include <cgnat/cgnat_session.h>
+#include <cgnat/cgnat_inlines.h>
+
+#define foreach_cgnat_out2in_error                                            \
+  _ (NO_MAPPING, "no-mapping", "no mapping for pool address and port")        \
+  _ (FILTERED, "filtered", "remote not allowed by filtering")                 \
+  _ (CAP, "cap", "subscriber session limit reached")                          \
+  _ (UNSUPPORTED, "unsupported", "protocol not translated")                   \
+  _ (TRUNCATED, "truncated", "L4 header truncated")
+
+typedef enum
+{
+#define _(sym, name, desc) CGNAT_OUT2IN_ERROR_##sym,
+  foreach_cgnat_out2in_error
+#undef _
+    CGNAT_OUT2IN_N_ERROR,
+} cgnat_out2in_error_t;
+
+static vlib_error_desc_t cgnat_out2in_error_counters[] = {
+#define _(sym, n, d) { .name = n, .desc = d, .severity = VL_COUNTER_SEVERITY_ERROR },
+  foreach_cgnat_out2in_error
+#undef _
+};
+
+typedef enum
+{
+  CGNAT_OUT2IN_NEXT_LOOKUP,
+  CGNAT_OUT2IN_NEXT_DROP,
+  CGNAT_OUT2IN_N_NEXT,
+} cgnat_out2in_next_t;
+
+typedef struct
+{
+  u32 sw_if_index;
+  u32 next_index;
+  u32 mapping_index;
+  u32 session_index;
+} cgnat_out2in_trace_t;
+
+static u8 *
+format_cgnat_out2in_trace (u8 *s, va_list *args)
+{
+  CLIB_UNUSED (vlib_main_t * vm) = va_arg (*args, vlib_main_t *);
+  CLIB_UNUSED (vlib_node_t * node) = va_arg (*args, vlib_node_t *);
+  cgnat_out2in_trace_t *t = va_arg (*args, cgnat_out2in_trace_t *);
+
+  return format (s, "CGNAT out2in: sw_if_index %u next %u mapping %d session %d",
+		 t->sw_if_index, t->next_index, t->mapping_index,
+		 t->session_index);
+}
+
+static_always_inline u32
+cgnat_out2in_one (vlib_node_runtime_t *node, cgnat_per_thread_t *t,
+		  u32 thread_index, vlib_buffer_t *b, f64 now,
+		  cgnat_mapping_t **mp, cgnat_session_t **sp)
+{
+  cgnat_main_t *cm = &cgnat_main;
+  ip4_header_t *ip = vlib_buffer_get_current (b);
+  int non_first = vnet_buffer (b)->ip.reass.is_non_first_fragment;
+  u32 rx_fib, next;
+  u16 out_port, r_port;
+  cgnat_mapping_t *m;
+  cgnat_session_t *s;
+  cgnat_sub_t *sub;
+  u8 proto;
+
+  rx_fib = ip4_fib_table_get_index_for_sw_if_index (
+    vnet_buffer (b)->sw_if_index[VLIB_RX]);
+
+  /* not addressed to a pool: not ours */
+  if (!cgnat_map_by_outside (rx_fib, &ip->dst_address))
+    {
+      vnet_feature_next (&next, b);
+      return next;
+    }
+
+  proto = cgnat_proto_of (ip->protocol);
+  if (PREDICT_FALSE (proto != CGNAT_PROTO_UDP && proto != CGNAT_PROTO_TCP))
+    {
+      b->error = node->errors[CGNAT_OUT2IN_ERROR_UNSUPPORTED];
+      return CGNAT_OUT2IN_NEXT_DROP;
+    }
+  if (PREDICT_FALSE (vnet_buffer (b)->ip.reass.l4_hdr_truncated))
+    {
+      b->error = node->errors[CGNAT_OUT2IN_ERROR_TRUNCATED];
+      return CGNAT_OUT2IN_NEXT_DROP;
+    }
+
+  out_port = vnet_buffer (b)->ip.reass.l4_dst_port;
+  r_port = vnet_buffer (b)->ip.reass.l4_src_port;
+
+  m = cgnat_mapping_find (t, 1, rx_fib, ip->dst_address.as_u32, out_port,
+			  proto);
+  if (PREDICT_FALSE (!m))
+    {
+      b->error = node->errors[CGNAT_OUT2IN_ERROR_NO_MAPPING];
+      return CGNAT_OUT2IN_NEXT_DROP;
+    }
+
+  s = cgnat_session_find (t, m - t->mappings, ip->src_address.as_u32, r_port);
+  if (PREDICT_FALSE (!s))
+    {
+      if (!cm->endpoint_independent_filtering &&
+	  !cgnat_adf_allows (t, m - t->mappings, ip->src_address.as_u32))
+	{
+	  b->error = node->errors[CGNAT_OUT2IN_ERROR_FILTERED];
+	  return CGNAT_OUT2IN_NEXT_DROP;
+	}
+      sub = pool_elt_at_index (t->subs_pool, m->sub_index);
+      if (sub->n_sessions >= cm->sessions_per_sub)
+	{
+	  b->error = node->errors[CGNAT_OUT2IN_ERROR_CAP];
+	  return CGNAT_OUT2IN_NEXT_DROP;
+	}
+      s = cgnat_session_create (t, thread_index, m, ip->src_address.as_u32,
+				r_port, CGNAT_TO_TCP_TRANS, now);
+    }
+  cgnat_session_touch (t, s, cgnat_session_class (s, proto, b, 0), now);
+
+  cgnat_rewrite (ip, 0, m->in_addr.as_u32, m->in_port, proto, non_first);
+  vnet_buffer (b)->sw_if_index[VLIB_TX] = m->in_fib_index;
+  *mp = m;
+  *sp = s;
+  return CGNAT_OUT2IN_NEXT_LOOKUP;
+}
+
+VLIB_NODE_FN (cgnat_out2in_node)
+(vlib_main_t *vm, vlib_node_runtime_t *node, vlib_frame_t *frame)
+{
+  cgnat_main_t *cm = &cgnat_main;
+  u32 thread_index = vm->thread_index;
+  cgnat_per_thread_t *t = vec_elt_at_index (cm->per_thread, thread_index);
+  vlib_buffer_t *bufs[VLIB_FRAME_SIZE], **b = bufs;
+  u16 nexts[VLIB_FRAME_SIZE], *next = nexts;
+  u32 *from = vlib_frame_vector_args (frame);
+  u32 n_left = frame->n_vectors;
+  f64 now = vlib_time_now (vm);
+
+  vlib_get_buffers (vm, from, bufs, n_left);
+  while (n_left)
+    {
+      cgnat_mapping_t *m = 0;
+      cgnat_session_t *s = 0;
+
+      next[0] = cgnat_out2in_one (node, t, thread_index, b[0], now, &m, &s);
+      if (PREDICT_FALSE (b[0]->flags & VLIB_BUFFER_IS_TRACED))
+	{
+	  cgnat_out2in_trace_t *tr =
+	    vlib_add_trace (vm, node, b[0], sizeof (*tr));
+	  tr->sw_if_index = vnet_buffer (b[0])->sw_if_index[VLIB_RX];
+	  tr->next_index = next[0];
+	  tr->mapping_index = m ? m - t->mappings : ~0;
+	  tr->session_index = s ? s - t->sessions_pool : ~0;
+	}
+      b++;
+      next++;
+      n_left--;
+    }
+  vlib_buffer_enqueue_to_next (vm, node, from, nexts, frame->n_vectors);
+  return frame->n_vectors;
+}
+
+VLIB_REGISTER_NODE (cgnat_out2in_node) = {
+  .name = "cgnat-out2in",
+  .vector_size = sizeof (u32),
+  .format_trace = format_cgnat_out2in_trace,
+  .type = VLIB_NODE_TYPE_INTERNAL,
+  .n_errors = CGNAT_OUT2IN_N_ERROR,
+  .error_counters = cgnat_out2in_error_counters,
+  .n_next_nodes = CGNAT_OUT2IN_N_NEXT,
+  .next_nodes = {
+    [CGNAT_OUT2IN_NEXT_LOOKUP] = "ip4-lookup",
+    [CGNAT_OUT2IN_NEXT_DROP] = "error-drop",
+  },
+};
+
+VNET_FEATURE_INIT (cgnat_out2in_feature, static) = {
+  .arc_name = "ip4-unicast",
+  .node_name = "cgnat-out2in",
+  .runs_after = VNET_FEATURES ("acl-plugin-in-ip4-fa",
+			       "ip4-sv-reassembly-feature",
+			       "ip4-dhcp-client-detect"),
+};
