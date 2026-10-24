@@ -20,6 +20,8 @@
   _ (TRUNCATED, "truncated", "L4 header truncated")                           \
   _ (OPTIONS, "options", "IPv4 options not translated")                       \
   _ (NOT_READY, "not-ready", "cluster node not serving yet")                  \
+  _ (STEER_LOOP, "steer-loop", "steered packet for a subscriber we don't own")\
+  _ (FENCED, "fenced", "owned by the peer but the pair link is down")         \
   _ (TABLE_FULL, "table-full", "thread session table full")                   \
   _ (CONGESTION, "congestion", "handoff queue full")
 
@@ -112,7 +114,8 @@ cgnat_in2out_icmp_error (vlib_main_t *vm, vlib_node_runtime_t *node,
 static_always_inline u32
 cgnat_in2out_one (vlib_main_t *vm, vlib_node_runtime_t *node, cgnat_per_thread_t *t,
 		  u32 thread_index, vlib_buffer_t *b, f64 now,
-		  cgnat_mapping_t **mp, cgnat_session_t **sp, u16 *owner)
+		  cgnat_mapping_t **mp, cgnat_session_t **sp, u16 *owner,
+		  int is_steered)
 {
   ip4_header_t *ip = vlib_buffer_get_current (b);
   int non_first = vnet_buffer (b)->ip.reass.is_non_first_fragment;
@@ -124,13 +127,33 @@ cgnat_in2out_one (vlib_main_t *vm, vlib_node_runtime_t *node, cgnat_per_thread_t
   cgnat_map_t *map;
   u8 proto;
 
-  rx_fib = ip4_fib_table_get_index_for_sw_if_index (
-    vnet_buffer (b)->sw_if_index[VLIB_RX]);
+  /* steered packets carry their fib in sw_if_index[VLIB_TX] */
+  rx_fib = is_steered ? vnet_buffer (b)->sw_if_index[VLIB_TX] :
+			ip4_fib_table_get_index_for_sw_if_index (
+			  vnet_buffer (b)->sw_if_index[VLIB_RX]);
 
   proto = cgnat_proto_of (ip->protocol);
   map = cgnat_map_by_inside (rx_fib, &ip->src_address);
   if (PREDICT_TRUE (map != 0))
     {
+      cgnat_cluster_t *cl = &cgnat_main.cluster;
+      u8 on = cgnat_owner_node (map->in_table_id, ip->src_address.as_u32);
+
+      if (PREDICT_FALSE (on && on != cl->node_id))
+	{
+	  if (is_steered)
+	    {
+	      b->error = node->errors[CGNAT_IN2OUT_ERROR_STEER_LOOP];
+	      return CGNAT_IN2OUT_NEXT_DROP;
+	    }
+	  if (!cl->pair_alive)
+	    {
+	      b->error = node->errors[CGNAT_IN2OUT_ERROR_FENCED];
+	      return CGNAT_IN2OUT_NEXT_DROP;
+	    }
+	  vnet_buffer (b)->sw_if_index[VLIB_TX] = map->in_table_id;
+	  return CGNAT_NEXT_STEER;
+	}
       *owner = cgnat_owner_thread (map->in_table_id, ip->src_address.as_u32);
       if (PREDICT_FALSE (*owner != thread_index))
 	return CGNAT_NEXT_HANDOFF;
@@ -257,12 +280,18 @@ again:
   return CGNAT_IN2OUT_NEXT_LOOKUP;
 
 pass:
+  if (is_steered)
+    {
+      b->error = node->errors[CGNAT_IN2OUT_ERROR_NO_MAP];
+      return CGNAT_IN2OUT_NEXT_DROP;
+    }
   vnet_feature_next (&next, b);
   return next;
 }
 
-VLIB_NODE_FN (cgnat_in2out_node)
-(vlib_main_t *vm, vlib_node_runtime_t *node, vlib_frame_t *frame)
+static_always_inline uword
+cgnat_in2out_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
+		     vlib_frame_t *frame, int is_steered)
 {
   cgnat_main_t *cm = &cgnat_main;
   u32 thread_index = vm->thread_index;
@@ -281,7 +310,7 @@ VLIB_NODE_FN (cgnat_in2out_node)
       cgnat_session_t *s = 0;
 
       next[0] = cgnat_in2out_one (vm, node, t, thread_index, b[0], now, &m,
-				  &s, owner);
+				  &s, owner, is_steered);
       if (PREDICT_FALSE (b[0]->flags & VLIB_BUFFER_IS_TRACED))
 	{
 	  cgnat_in2out_trace_t *tr =
@@ -301,12 +330,42 @@ VLIB_NODE_FN (cgnat_in2out_node)
   vlib_increment_simple_counter (
     &cm->counters[CGNAT_COUNTER_IN2OUT_PACKETS], thread_index, 0, n_ok);
   n_drop = cgnat_dispatch (vm, node, from, nexts, owners, frame->n_vectors,
-			   cm->fq_in2out_index);
+			   is_steered ? cm->fq_in2out_steered_index :
+					cm->fq_in2out_index,
+			   CGNAT_STEER_IN2OUT);
   if (n_drop)
     vlib_node_increment_counter (vm, node->node_index,
 				 CGNAT_IN2OUT_ERROR_CONGESTION, n_drop);
   return frame->n_vectors;
 }
+
+VLIB_NODE_FN (cgnat_in2out_node)
+(vlib_main_t *vm, vlib_node_runtime_t *node, vlib_frame_t *frame)
+{
+  return cgnat_in2out_inline (vm, node, frame, 0);
+}
+
+VLIB_NODE_FN (cgnat_in2out_steered_node)
+(vlib_main_t *vm, vlib_node_runtime_t *node, vlib_frame_t *frame)
+{
+  return cgnat_in2out_inline (vm, node, frame, 1);
+}
+
+VLIB_REGISTER_NODE (cgnat_in2out_steered_node) = {
+  .name = "cgnat-in2out-steered",
+  .vector_size = sizeof (u32),
+  .format_trace = format_cgnat_in2out_trace,
+  .type = VLIB_NODE_TYPE_INTERNAL,
+  .n_errors = CGNAT_IN2OUT_N_ERROR,
+  .error_counters = cgnat_in2out_error_counters,
+  .n_next_nodes = CGNAT_IN2OUT_N_NEXT,
+  .next_nodes = {
+    [CGNAT_IN2OUT_NEXT_LOOKUP] = "ip4-lookup",
+    [CGNAT_IN2OUT_NEXT_DROP] = "error-drop",
+    [CGNAT_IN2OUT_NEXT_ICMP_ERROR] = "ip4-icmp-error",
+    [CGNAT_IN2OUT_NEXT_HAIRPIN] = "cgnat-hairpin",
+  },
+};
 
 VLIB_REGISTER_NODE (cgnat_in2out_node) = {
   .name = "cgnat-in2out",

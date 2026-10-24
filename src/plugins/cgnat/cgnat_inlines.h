@@ -27,6 +27,8 @@ cgnat_owner_thread (u32 in_table_id, u32 in_addr)
 
 /* next index meaning "hand off to the owner thread" */
 #define CGNAT_NEXT_HANDOFF ((u32) ~0)
+/* next index meaning "steer to the owner node over the pair link" */
+#define CGNAT_NEXT_STEER ((u32) ~1)
 
 /*
  * Enqueue a frame whose buffers were each marked either with a real next
@@ -35,15 +37,18 @@ cgnat_owner_thread (u32 in_table_id, u32 in_addr)
  */
 static_always_inline u32
 cgnat_dispatch (vlib_main_t *vm, vlib_node_runtime_t *node, u32 *from,
-		u32 *nexts, u16 *owners, u32 n, u32 fq_index)
+		u32 *nexts, u16 *owners, u32 n, u32 fq_index, u8 steer_dir)
 {
   u32 local_bi[VLIB_FRAME_SIZE], ho_bi[VLIB_FRAME_SIZE];
+  u32 steer_bi[VLIB_FRAME_SIZE];
   u16 local_next[VLIB_FRAME_SIZE], ho_ti[VLIB_FRAME_SIZE];
-  u32 n_local = 0, n_ho = 0, i, n_enq;
+  u32 n_local = 0, n_ho = 0, n_steer = 0, i, n_enq;
 
   for (i = 0; i < n; i++)
     {
-      if (PREDICT_FALSE (nexts[i] == CGNAT_NEXT_HANDOFF))
+      if (PREDICT_FALSE (nexts[i] == CGNAT_NEXT_STEER))
+	steer_bi[n_steer++] = from[i];
+      else if (PREDICT_FALSE (nexts[i] == CGNAT_NEXT_HANDOFF))
 	{
 	  ho_bi[n_ho] = from[i];
 	  ho_ti[n_ho++] = owners[i];
@@ -56,6 +61,8 @@ cgnat_dispatch (vlib_main_t *vm, vlib_node_runtime_t *node, u32 *from,
     }
   if (n_local)
     vlib_buffer_enqueue_to_next (vm, node, local_bi, local_next, n_local);
+  if (n_steer)
+    cgnat_steer_send (vm, steer_bi, n_steer, steer_dir);
   if (!n_ho)
     return 0;
   n_enq = vlib_buffer_enqueue_to_thread (vm, node, fq_index, ho_bi, ho_ti,

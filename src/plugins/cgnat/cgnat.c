@@ -243,6 +243,12 @@ cgnat_main_loop_enter (vlib_main_t *vm)
   cm->fq_out2in_index = vlib_frame_queue_main_init (cgnat_out2in_node.index, 0);
   cm->fq_hairpin_index =
     vlib_frame_queue_main_init (cgnat_hairpin_node.index, 0);
+  cm->fq_in2out_steered_index =
+    vlib_frame_queue_main_init (cgnat_in2out_steered_node.index, 0);
+  cm->fq_out2in_steered_index =
+    vlib_frame_queue_main_init (cgnat_out2in_steered_node.index, 0);
+  cm->fq_hairpin_steered_index =
+    vlib_frame_queue_main_init (cgnat_hairpin_steered_node.index, 0);
 
   /* cluster from startup.conf */
   {

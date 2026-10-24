@@ -55,11 +55,22 @@ typedef enum
   CGNAT_STEER_HAIRPIN = 2,
 } cgnat_steer_dir_t;
 
+#define CGNAT_STEER_NON_FIRST_FRAG (1 << 0)
+#define CGNAT_STEER_TRUNCATED	   (1 << 1)
+
+/*
+ * The steered packet's shallow-reassembly metadata travels with it: the
+ * receiving node's reassembly ran on the outer packet, and a non-first
+ * fragment carries no ports of its own.
+ */
 typedef CLIB_PACKED (struct {
   u8 direction;
+  u8 reass_flags;	     /* CGNAT_STEER_* */
+  u8 icmp_type_or_tcp_flags;
   u8 pad;
-  u16 pad2;
-  u32 table_id; /* table of the fib the packet was in */
+  u32 table_id;		     /* table of the fib the packet was in */
+  u16 l4_src_port;	     /* network order, as sv-reass reports them */
+  u16 l4_dst_port;
 }) cgnat_msg_steer_t;
 
 typedef CLIB_PACKED (struct {

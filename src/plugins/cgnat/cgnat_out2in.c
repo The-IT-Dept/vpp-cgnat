@@ -19,6 +19,8 @@
   _ (TRUNCATED, "truncated", "L4 header truncated")                           \
   _ (OPTIONS, "options", "IPv4 options not translated")                       \
   _ (NOT_READY, "not-ready", "cluster node not serving yet")                  \
+  _ (STEER_LOOP, "steer-loop", "steered packet for a subscriber we don't own")\
+  _ (FENCED, "fenced", "owned by the peer but the pair link is down")         \
   _ (TO_INSIDE, "to-inside", "outside traffic addressed to an inside prefix") \
   _ (TABLE_FULL, "table-full", "thread session table full")                   \
   _ (CONGESTION, "congestion", "handoff queue full")
@@ -111,7 +113,7 @@ static_always_inline u32
 cgnat_out2in_one (vlib_main_t *vm, vlib_node_runtime_t *node,
 		  cgnat_per_thread_t *t, u32 thread_index, vlib_buffer_t *b,
 		  f64 now, cgnat_mapping_t **mp, cgnat_session_t **sp,
-		  u16 *owner, int is_hairpin)
+		  u16 *owner, int is_hairpin, int is_steered)
 {
   cgnat_main_t *cm = &cgnat_main;
   ip4_header_t *ip = vlib_buffer_get_current (b);
@@ -125,7 +127,7 @@ cgnat_out2in_one (vlib_main_t *vm, vlib_node_runtime_t *node,
   u8 proto;
 
   /* hairpinned packets were translated by in2out into the outside fib */
-  rx_fib = is_hairpin ? vnet_buffer (b)->sw_if_index[VLIB_TX] :
+  rx_fib = (is_hairpin || is_steered) ? vnet_buffer (b)->sw_if_index[VLIB_TX] :
 			ip4_fib_table_get_index_for_sw_if_index (
 			  vnet_buffer (b)->sw_if_index[VLIB_RX]);
 
@@ -135,12 +137,13 @@ cgnat_out2in_one (vlib_main_t *vm, vlib_node_runtime_t *node,
     {
       /* with inside and outside in one table, never route the outside
 	 straight to a subscriber */
-      if (!is_hairpin && cgnat_map_by_inside (rx_fib, &ip->dst_address))
+      if (!is_hairpin && !is_steered &&
+	  cgnat_map_by_inside (rx_fib, &ip->dst_address))
 	{
 	  b->error = node->errors[CGNAT_OUT2IN_ERROR_TO_INSIDE];
 	  return CGNAT_OUT2IN_NEXT_DROP;
 	}
-      if (is_hairpin)
+      if (is_hairpin || is_steered)
 	{
 	  b->error = node->errors[CGNAT_OUT2IN_ERROR_NO_MAPPING];
 	  return CGNAT_OUT2IN_NEXT_DROP;
@@ -171,6 +174,26 @@ cgnat_out2in_one (vlib_main_t *vm, vlib_node_runtime_t *node,
 	b->error = node->errors[CGNAT_OUT2IN_ERROR_NO_MAPPING];
 	return CGNAT_OUT2IN_NEXT_DROP;
       }
+    {
+      cgnat_cluster_t *cl = &cgnat_main.cluster;
+      u8 on = cgnat_owner_node (map->in_table_id, in.as_u32);
+
+      if (PREDICT_FALSE (on && on != cl->node_id))
+	{
+	  if (is_steered)
+	    {
+	      b->error = node->errors[CGNAT_OUT2IN_ERROR_STEER_LOOP];
+	      return CGNAT_OUT2IN_NEXT_DROP;
+	    }
+	  if (!cl->pair_alive)
+	    {
+	      b->error = node->errors[CGNAT_OUT2IN_ERROR_FENCED];
+	      return CGNAT_OUT2IN_NEXT_DROP;
+	    }
+	  vnet_buffer (b)->sw_if_index[VLIB_TX] = map->out_table_id;
+	  return CGNAT_NEXT_STEER;
+	}
+    }
     *owner = cgnat_owner_thread (map->in_table_id, in.as_u32);
     if (PREDICT_FALSE (*owner != thread_index))
       return CGNAT_NEXT_HANDOFF;
@@ -254,7 +277,7 @@ cgnat_out2in_one (vlib_main_t *vm, vlib_node_runtime_t *node,
 
 static_always_inline uword
 cgnat_out2in_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
-		     vlib_frame_t *frame, int is_hairpin)
+		     vlib_frame_t *frame, int is_hairpin, int is_steered)
 {
   cgnat_main_t *cm = &cgnat_main;
   u32 thread_index = vm->thread_index;
@@ -273,7 +296,7 @@ cgnat_out2in_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
       cgnat_session_t *s = 0;
 
       next[0] = cgnat_out2in_one (vm, node, t, thread_index, b[0], now, &m,
-				  &s, owner, is_hairpin);
+				  &s, owner, is_hairpin, is_steered);
       if (PREDICT_FALSE (b[0]->flags & VLIB_BUFFER_IS_TRACED))
 	{
 	  cgnat_out2in_trace_t *tr =
@@ -294,9 +317,13 @@ cgnat_out2in_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
     &cm->counters[is_hairpin ? CGNAT_COUNTER_HAIRPIN_PACKETS :
 			       CGNAT_COUNTER_OUT2IN_PACKETS],
     thread_index, 0, n_ok);
-  n_drop = cgnat_dispatch (vm, node, from, nexts, owners, frame->n_vectors,
-			   is_hairpin ? cm->fq_hairpin_index :
-					cm->fq_out2in_index);
+  n_drop = cgnat_dispatch (
+    vm, node, from, nexts, owners, frame->n_vectors,
+    is_hairpin ? (is_steered ? cm->fq_hairpin_steered_index :
+			       cm->fq_hairpin_index) :
+		 (is_steered ? cm->fq_out2in_steered_index :
+			       cm->fq_out2in_index),
+    is_hairpin ? CGNAT_STEER_HAIRPIN : CGNAT_STEER_OUT2IN);
   if (n_drop)
     vlib_node_increment_counter (vm, node->node_index,
 				 CGNAT_OUT2IN_ERROR_CONGESTION, n_drop);
@@ -306,13 +333,45 @@ cgnat_out2in_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 VLIB_NODE_FN (cgnat_out2in_node)
 (vlib_main_t *vm, vlib_node_runtime_t *node, vlib_frame_t *frame)
 {
-  return cgnat_out2in_inline (vm, node, frame, 0);
+  return cgnat_out2in_inline (vm, node, frame, 0, 0);
 }
+
+VLIB_NODE_FN (cgnat_out2in_steered_node)
+(vlib_main_t *vm, vlib_node_runtime_t *node, vlib_frame_t *frame)
+{
+  return cgnat_out2in_inline (vm, node, frame, 0, 1);
+}
+
+VLIB_NODE_FN (cgnat_hairpin_steered_node)
+(vlib_main_t *vm, vlib_node_runtime_t *node, vlib_frame_t *frame)
+{
+  return cgnat_out2in_inline (vm, node, frame, 1, 1);
+}
+
+#define cgnat_out2in_node_regs(n)                                             \
+  .vector_size = sizeof (u32), .format_trace = format_cgnat_out2in_trace,     \
+  .type = VLIB_NODE_TYPE_INTERNAL, .n_errors = CGNAT_OUT2IN_N_ERROR,         \
+  .error_counters = cgnat_out2in_error_counters,                             \
+  .n_next_nodes = CGNAT_OUT2IN_N_NEXT,                                       \
+  .next_nodes = {                                                            \
+    [CGNAT_OUT2IN_NEXT_LOOKUP] = "ip4-lookup",                               \
+    [CGNAT_OUT2IN_NEXT_DROP] = "error-drop",                                 \
+  }
+
+VLIB_REGISTER_NODE (cgnat_out2in_steered_node) = {
+  .name = "cgnat-out2in-steered",
+  cgnat_out2in_node_regs (0),
+};
+
+VLIB_REGISTER_NODE (cgnat_hairpin_steered_node) = {
+  .name = "cgnat-hairpin-steered",
+  cgnat_out2in_node_regs (0),
+};
 
 VLIB_NODE_FN (cgnat_hairpin_node)
 (vlib_main_t *vm, vlib_node_runtime_t *node, vlib_frame_t *frame)
 {
-  return cgnat_out2in_inline (vm, node, frame, 1);
+  return cgnat_out2in_inline (vm, node, frame, 1, 0);
 }
 
 VLIB_REGISTER_NODE (cgnat_hairpin_node) = {

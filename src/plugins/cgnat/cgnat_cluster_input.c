@@ -12,10 +12,13 @@
 #include <vnet/vnet.h>
 #include <vnet/ip/ip4_packet.h>
 #include <vnet/udp/udp_packet.h>
+#include <vnet/fib/fib_table.h>
 #include <cgnat/cgnat.h>
 
 #define foreach_cgnat_cluster_input_error                                     \
   _ (HELLO, "hello", "HELLOs received")                                       \
+  _ (STEER, "steer", "steered packets received")                              \
+  _ (NO_TABLE, "no-table", "steered packet for an unknown table")             \
   _ (BAD, "bad", "malformed or wrong version")                                \
   _ (UNKNOWN_PATH, "unknown-path", "HELLO on no configured path")             \
   _ (DUPLICATE, "duplicate-node-id", "peer uses our node id")                 \
@@ -38,6 +41,9 @@ static vlib_error_desc_t cgnat_cluster_input_error_counters[] = {
 typedef enum
 {
   CGNAT_CLUSTER_INPUT_NEXT_DROP,
+  CGNAT_CLUSTER_INPUT_NEXT_IN2OUT,
+  CGNAT_CLUSTER_INPUT_NEXT_OUT2IN,
+  CGNAT_CLUSTER_INPUT_NEXT_HAIRPIN,
   CGNAT_CLUSTER_INPUT_N_NEXT,
 } cgnat_cluster_input_next_t;
 
@@ -72,14 +78,49 @@ cgnat_cluster_hello (vlib_main_t *vm, cgnat_cluster_t *cl, ip4_header_t *ip,
   return CGNAT_CLUSTER_INPUT_ERROR_HELLO;
 }
 
+/* strip outer headers; restore the packet's reassembly metadata */
+static_always_inline u32
+cgnat_cluster_steer (vlib_main_t *vm, cgnat_cluster_t *cl, vlib_buffer_t *b,
+		     ip4_header_t *ip, cgnat_msg_hdr_t *h, u32 len, u32 *next)
+{
+  cgnat_msg_steer_t *st = (cgnat_msg_steer_t *) (h + 1);
+  u32 fib_index;
+
+  if (len < sizeof (*h) + sizeof (*st) + sizeof (ip4_header_t) ||
+      st->direction > CGNAT_STEER_HAIRPIN ||
+      ip->src_address.as_u32 != cl->paths[0].peer.as_u32)
+    return CGNAT_CLUSTER_INPUT_ERROR_BAD;
+  fib_index = fib_table_find (FIB_PROTOCOL_IP4,
+			      clib_net_to_host_u32 (st->table_id));
+  if (fib_index == ~0)
+    return CGNAT_CLUSTER_INPUT_ERROR_NO_TABLE;
+
+  vnet_buffer (b)->ip.reass.is_non_first_fragment =
+    !!(st->reass_flags & CGNAT_STEER_NON_FIRST_FRAG);
+  vnet_buffer (b)->ip.reass.l4_hdr_truncated =
+    !!(st->reass_flags & CGNAT_STEER_TRUNCATED);
+  vnet_buffer (b)->ip.reass.icmp_type_or_tcp_flags =
+    st->icmp_type_or_tcp_flags;
+  vnet_buffer (b)->ip.reass.l4_src_port = st->l4_src_port;
+  vnet_buffer (b)->ip.reass.l4_dst_port = st->l4_dst_port;
+  vlib_buffer_advance (b, sizeof (*h) + sizeof (*st));
+  vnet_buffer (b)->sw_if_index[VLIB_TX] = fib_index;
+  *next = CGNAT_CLUSTER_INPUT_NEXT_IN2OUT + st->direction;
+  vlib_increment_simple_counter (
+    &cgnat_main.counters[CGNAT_COUNTER_STEERED_IN], vm->thread_index, 0, 1);
+  return CGNAT_CLUSTER_INPUT_ERROR_STEER;
+}
+
 VLIB_NODE_FN (cgnat_cluster_input_node)
 (vlib_main_t *vm, vlib_node_runtime_t *node, vlib_frame_t *frame)
 {
   cgnat_cluster_t *cl = &cgnat_main.cluster;
   u32 *from = vlib_frame_vector_args (frame), n = frame->n_vectors, i;
+  u16 nexts[VLIB_FRAME_SIZE];
 
   for (i = 0; i < n; i++)
     {
+      u32 next = CGNAT_CLUSTER_INPUT_NEXT_DROP;
       vlib_buffer_t *b = vlib_get_buffer (vm, from[i]);
       cgnat_msg_hdr_t *h = vlib_buffer_get_current (b);
       ip4_header_t *ip = (ip4_header_t *) ((u8 *) h - sizeof (udp_header_t) -
@@ -92,11 +133,14 @@ VLIB_NODE_FN (cgnat_cluster_input_node)
 	e = CGNAT_CLUSTER_INPUT_ERROR_BAD;
       else if (h->type == CGNAT_MSG_HELLO)
 	e = cgnat_cluster_hello (vm, cl, ip, h, len);
+      else if (h->type == CGNAT_MSG_STEER)
+	e = cgnat_cluster_steer (vm, cl, b, ip, h, len, &next);
       else
 	e = CGNAT_CLUSTER_INPUT_ERROR_UNSUPPORTED;
       vlib_node_increment_counter (vm, node->node_index, e, 1);
+      nexts[i] = next;
     }
-  vlib_buffer_free (vm, from, n);
+  vlib_buffer_enqueue_to_next (vm, node, from, nexts, n);
   return n;
 }
 
@@ -109,5 +153,8 @@ VLIB_REGISTER_NODE (cgnat_cluster_input_node) = {
   .n_next_nodes = CGNAT_CLUSTER_INPUT_N_NEXT,
   .next_nodes = {
     [CGNAT_CLUSTER_INPUT_NEXT_DROP] = "error-drop",
+    [CGNAT_CLUSTER_INPUT_NEXT_IN2OUT] = "cgnat-in2out-steered",
+    [CGNAT_CLUSTER_INPUT_NEXT_OUT2IN] = "cgnat-out2in-steered",
+    [CGNAT_CLUSTER_INPUT_NEXT_HAIRPIN] = "cgnat-hairpin-steered",
   },
 };

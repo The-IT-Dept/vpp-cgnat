@@ -13,6 +13,7 @@ add_vpp_plugin(cgnat
   cgnat_expire.c
   cgnat_cluster.c
   cgnat_cluster_input.c
+  cgnat_steer.c
 
   MULTIARCH_SOURCES
   cgnat_in2out.c

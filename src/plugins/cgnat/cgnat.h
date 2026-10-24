@@ -39,6 +39,8 @@ typedef enum
   _ (IN2OUT_PACKETS, "in2out-packets")                                        \
   _ (OUT2IN_PACKETS, "out2in-packets")                                        \
   _ (HAIRPIN_PACKETS, "hairpin-packets")                                      \
+  _ (STEERED_OUT, "steered-out")                                              \
+  _ (STEERED_IN, "steered-in")                                                \
   _ (SESSIONS, "sessions")                                                    \
   _ (MAPPINGS, "mappings")                                                    \
   _ (SUBSCRIBERS, "subscribers")
@@ -125,6 +127,9 @@ typedef struct
   u32 fq_in2out_index;
   u32 fq_out2in_index;
   u32 fq_hairpin_index;
+  u32 fq_in2out_steered_index;
+  u32 fq_out2in_steered_index;
+  u32 fq_hairpin_steered_index;
 
   /* policy */
   u32 timeouts[CGNAT_N_TO];
@@ -158,6 +163,13 @@ extern cgnat_main_t cgnat_main;
 extern vlib_node_registration_t cgnat_in2out_node;
 extern vlib_node_registration_t cgnat_out2in_node;
 extern vlib_node_registration_t cgnat_hairpin_node;
+extern vlib_node_registration_t cgnat_in2out_steered_node;
+extern vlib_node_registration_t cgnat_out2in_steered_node;
+extern vlib_node_registration_t cgnat_hairpin_steered_node;
+
+/* encapsulate buffers (table id stashed in sw_if_index[VLIB_TX]) and send
+   them to the owner over the pair link */
+void cgnat_steer_send (vlib_main_t *vm, u32 *bis, u32 n, u8 direction);
 
 static_always_inline void
 cgnat_gauge (u32 thread_index, cgnat_counter_t c, int delta)
