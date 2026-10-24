@@ -31,7 +31,7 @@
   - timeouts: tcp-established 7440 s, tcp-transitory 240 s, udp 300 s, icmp 60 s
   - sessions-per-subscriber: 1000
   - filtering: address-dependent
-- Changing a map with live sessions is refused (`del` then `add`). Deleting a map flushes its sessions.
+- There is no in-place map modify: a change is `del` (which flushes that map's sessions) then `add`. An `add` that overlaps an existing map in the same inside VRF is always refused.
 - Untranslatable traffic is dropped and counted, never leaked. That covers no map, no mapping, filtered, cap reached and block exhausted.
 - Clustering, sync and the config hash are Phase 2. Leave no hooks you'd have to guess at; keep `cgnat_main_t` extensible.
 
@@ -321,7 +321,7 @@ def test_startup_conf_applied(self):        # extra_vpp_config sets limit 7, udp
 def test_stats_counters(self):              # 5 flows out and back -> /cgnat/in2out-packets >= 5, /cgnat/sessions == 5 (statistics.get_counter)
 def test_session_dump(self):                # dump shows the 5 sessions with the right in/out/remote tuples
 def test_map_delete_flushes_sessions(self): # with live sessions, map del -> sessions/mappings gauges 0; next packet -> "no-map"; no crash
-def test_map_change_refused_with_sessions(self): # add an overlapping map (same in vrf) while sessions live -> retval != 0
+def test_map_readd_after_flush(self):       # del then re-add the same map -> new flows translate; old inside port gets the same outside port as before
 ```
 
 - [ ] **Steps 2–5:** run and see it fail; implement; run and see it pass; commit `"Ops: startup.conf, stats segment, session dump/status, map flush"`.
