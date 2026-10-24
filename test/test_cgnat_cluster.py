@@ -300,6 +300,25 @@ class TestCgnatClusterHello(CgnatClusterCase):
         st = self.status()
         self.assertEqual((st.ready, st.reason), (False, "starting"))
 
+    def test_starting_waits_for_pair_link_up(self):
+        """Pair address on an interface that is admin-up but has no carrier (a VF
+        still coming up, a memberless bond): stay starting, never 'alone'"""
+        r = self.vapi.bond_create2(mode=3, lb=1, numa_only=False, enable_gso=False,
+                                   use_custom_mac=False, mac_address="00:00:00:00:00:00",
+                                   id=77)
+        bond = r.sw_if_index
+        self.vapi.sw_interface_set_flags(bond, flags=1)
+        self.vapi.sw_interface_add_del_address(sw_if_index=bond, is_add=1,
+                                               prefix="10.255.77.1/24")
+        try:
+            self.cluster_on(local="10.255.77.1", peer="10.255.77.2")
+            self.sleep(1.0)
+            st = self.status()
+            self.assertEqual((st.ready, st.reason), (False, "starting"))
+        finally:
+            self.cluster_on()
+            self.vapi.bond_delete(sw_if_index=bond)
+
     def test_unconfigured_not_ready(self):
         """No maps: never ready (can't become the serving node)"""
         self.assertTrue(self.wait_for(lambda: self.status().ready))

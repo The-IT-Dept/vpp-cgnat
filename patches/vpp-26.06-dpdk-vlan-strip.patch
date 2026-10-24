@@ -1,0 +1,59 @@
+diff --git a/src/plugins/dpdk/device/common.c b/src/plugins/dpdk/device/common.c
+index 29bfdeaa8..d5b9bdc57 100644
+--- a/src/plugins/dpdk/device/common.c
++++ b/src/plugins/dpdk/device/common.c
+@@ -177,6 +177,11 @@ dpdk_device_setup (dpdk_device_t *xd)
+   if (xd->conf.enable_lro)
+     rxo |= RTE_ETH_RX_OFFLOAD_TCP_LRO;
+ 
++  /* strip the VLAN tag on receive, e.g. an SR-IOV VF whose VLAN the host
++     enforces (the host inserts it on transmit) */
++  if (xd->conf.enable_vlan_strip)
++    rxo |= RTE_ETH_RX_OFFLOAD_VLAN_STRIP;
++
+   /* per-device offload config */
+   if (xd->conf.enable_tso)
+     txo |= RTE_ETH_TX_OFFLOAD_TCP_CKSUM | RTE_ETH_TX_OFFLOAD_TCP_TSO |
+diff --git a/src/plugins/dpdk/device/dpdk.h b/src/plugins/dpdk/device/dpdk.h
+index 7b0225e5e..982b5e20f 100644
+--- a/src/plugins/dpdk/device/dpdk.h
++++ b/src/plugins/dpdk/device/dpdk.h
+@@ -145,6 +145,7 @@ typedef union
+     u16 disable_tx_checksum_offload : 1;
+     u16 disable_rss : 1;
+     u16 disable_rx_scatter : 1;
++    u16 enable_vlan_strip : 1;
+     u16 n_rx_queues;
+     u16 n_tx_queues;
+     u16 n_rx_desc;
+@@ -265,6 +266,7 @@ typedef struct
+ #undef _
+     clib_bitmap_t * workers;
+   u8 tso;
++  u8 vlan_strip;
+   u8 *devargs;
+   clib_bitmap_t *rss_queues;
+ 
+diff --git a/src/plugins/dpdk/device/init.c b/src/plugins/dpdk/device/init.c
+index 2b79b7778..cf39c6431 100644
+--- a/src/plugins/dpdk/device/init.c
++++ b/src/plugins/dpdk/device/init.c
+@@ -607,6 +607,9 @@ dpdk_lib_init (dpdk_main_t * dm)
+ 	  vnet_hw_if_tx_queue_assign_thread (vnm, qi, q);
+ 	}
+ 
++      if (devconf->vlan_strip)
++	xd->conf.enable_vlan_strip = 1;
++
+       if (devconf->tso == DPDK_DEVICE_TSO_ON)
+ 	{
+ 	  /*tcp_udp checksum must be enabled*/
+@@ -1048,6 +1051,8 @@ dpdk_device_config (dpdk_config_main_t *conf, void *addr,
+ 	{
+ 	  devconf->disable_rxq_int = 1;
+ 	}
++      else if (unformat (input, "vlan-strip-offload on"))
++	devconf->vlan_strip = 1;
+       else if (unformat (input, "tso on"))
+ 	{
+ 	  devconf->tso = DPDK_DEVICE_TSO_ON;

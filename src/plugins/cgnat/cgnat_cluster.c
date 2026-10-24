@@ -175,6 +175,23 @@ cgnat_cluster_send_resync_req (vlib_main_t *vm)
     cgnat_cluster_send (vm, &bi, 1);
 }
 
+/* is the path's local address on an interface that is up with link? */
+static int
+cgnat_path_link_up (cgnat_path_t *p)
+{
+  const load_balance_t *lb;
+  const dpo_id_t *dpo;
+  const receive_dpo_t *rd;
+
+  if (!cgnat_is_local (p->fib_index, &p->local))
+    return 0;
+  lb = load_balance_get (ip4_fib_forwarding_lookup (p->fib_index, &p->local));
+  dpo = load_balance_get_bucket_i (lb, 0);
+  rd = receive_dpo_get (dpo->dpoi_index);
+  return rd->rd_sw_if_index != ~0 &&
+	 vnet_sw_interface_is_link_up (vnet_get_main (), rd->rd_sw_if_index);
+}
+
 /* evaluate liveness and readiness; runs on main each hello interval */
 static void
 cgnat_cluster_evaluate (vlib_main_t *vm, f64 now)
@@ -207,11 +224,10 @@ cgnat_cluster_evaluate (vlib_main_t *vm, f64 now)
   cl->pair_alive = vec_len (cl->paths) && cl->paths[0].alive;
 
   /* starting lasts one dead interval from when our pair-link address
-     exists on an interface: until then we can't hear the peer, so we
-     must not conclude we're alone */
-  if (!vec_len (cl->paths) ||
-      !cgnat_is_local (cl->paths[0].fib_index, &cl->paths[0].local))
-    cl->enabled_at = now;
+     exists on an interface that has link: until then we can't hear the
+     peer, so we must not conclude we're alone */
+  if (!vec_len (cl->paths) || !cgnat_path_link_up (&cl->paths[0]))
+    cl->enabled_at = now; /* (a VF's link comes up after its address) */
   starting = now - cl->enabled_at < cl->dead_interval;
   dup = cl->dup_last > 0 && now - cl->dup_last < cl->dead_interval;
   mismatch = cl->peer_alive && cl->peer_config_hash != cl->config_hash;
