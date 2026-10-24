@@ -5,8 +5,9 @@ A carrier-grade NAT plugin for [VPP](https://fd.io), built around
 commodity servers.
 
 > **Status:** the single node (Phase 1) and the active/active pair (Phase 2) are
-> done and tested in VPP's `make test` (165 tests) and in a two-VPP lab with real
-> TCP/UDP flows and kill/restore. Production proof on two VMs is next. See
+> done, tested in VPP's `make test` (165 tests) and in a two-VPP lab with real
+> TCP/UDP flows and kill/restore, and running in production in front of an ISP
+> core router. See
 > [the design](docs/superpowers/specs/2026-10-24-cgnat-ha-design.md) and
 > [configuration](docs/config.md).
 
@@ -92,6 +93,15 @@ node B is killed with `kill -9` at 15 s and restarted at 35 s:
 |---|---|
 | without the pair (two independent nodes) | FAIL: UDP flows lose everything, TCP connections fail |
 | with the pair | PASS (repeatable): 14/14 TCP connections kept with the same public IP:port, no throughput dip at kill or restore, UDP worst gap per flow 0.6 s (failure detection + route change) |
+
+**Production proof** (2026-10-24). Two VMs (DPDK virtio, 2 workers each) in
+front of a Juniper MX204: static routes with BFD-checked next hops, ECMP, and
+`contrib/cgnat-ready-bfd.sh` on each node. The test ran on a real subscriber
+line (IPoE via the MX's BNG, CGNAT VRF):
+
+- A 792 MB HTTP download completed byte-perfect over one TCP connection while node 1 was killed with `kill -9` mid-transfer, restarted and rejoined, and then node 2 was killed.
+- The connection kept the same public IP:port throughout.
+- A 1-second ping through the same line lost 4 of 150 packets across the four events.
 
 ## Performance (single node, packet generator)
 
