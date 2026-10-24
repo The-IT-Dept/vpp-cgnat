@@ -101,7 +101,7 @@ The same settings are available as CLI (`cgnat cluster …`, `show cgnat cluster
   - `int cgnat_cluster_peer_alive (void);` (any path alive), and `int cgnat_cluster_pair_alive (void);`
   - `vlib_buffer_t *cgnat_cluster_alloc (vlib_main_t *vm, u32 path, u8 type, u32 seq, u32 body_len, void **body, u32 *bi);` builds outer IPv4/UDP and the header in a fresh buffer (outer DF clear, TTL 64), with `sw_if_index[VLIB_TX]` = the path fib.
   - `void cgnat_cluster_send (vlib_main_t *vm, u32 bi);` enqueues to ip4-lookup from any thread.
-  - Reasons: `none`, `alone`, `peer-resyncing`, `resyncing`, `config-mismatch`, `fenced`, `duplicate-node-id`.
+  - Reasons: `none`, `starting`, `alone`, `resyncing`, `config-mismatch`, `fenced`, `duplicate-node-id`.
   - API `cgnat_cluster_get_status` → node_id, peer_node_id, enabled, ready, fenced, reason (string 32), peer_alive, pair_alive, peer_ready, config_hash, peer_config_hash, epoch, peer_epoch.
 
 - [ ] **Step 1: Write the failing tests.** Topology:
@@ -114,7 +114,7 @@ The same settings are available as CLI (`cgnat cluster …`, `show cgnat cluster
 ```python
 def test_hello_sent(self):              # capture on pg2 within 0.5s: UDP 6200->6200, header v1 type 1 node 1, config_hash == status.config_hash, epoch != 0
 def test_peer_alive_and_dead(self):     # inject peer HELLOs (node 2, ready) every 100ms for 1s -> status.peer_alive; stop; after 0.7s -> not peer_alive
-def test_alone_is_ready(self):          # no peer ever -> status.ready and reason "alone"
+def test_starting_then_alone(self):     # right after cgnat_cluster_set: reason "starting", not ready, subscriber traffic dropped (not-ready); after 0.7s: ready, reason "alone"
 def test_config_hash_tracks_maps(self): # hash changes after cgnat map add, returns to old value after del
 def test_config_mismatch(self):         # peer HELLO with another hash -> not ready, reason "config-mismatch"
 def test_duplicate_node_id_refused(self): # peer HELLO with node_id 1 -> not peer_alive, reason "duplicate-node-id", not ready
@@ -126,7 +126,12 @@ def test_probe_path_hello(self):        # cgnat_cluster_path_add_del(local=pg3.l
   - A main-thread process sends HELLO on every path each hello-interval, evaluates liveness and ready each tick, and on change updates the stats gauges `/cgnat/cluster/ready`, `/cgnat/cluster/peer-alive` and `/cgnat/cluster/fenced` (use `vlib_stats_add_gauge`).
   - The input node is registered with `udp_register_dst_port (vm, port, cgnat_cluster_input_node.index, 1)`. On a HELLO it stores `last_rx`, the peer fields and the epoch with plain stores; the process reads them.
   - Ignore messages whose version != 1. Messages from node_id == own are duplicate-node-id.
-  - Ready rules for this task: alone → ready. Peer alive, hash equal and ids differ → ready (Task 5 adds the resync condition).
+  - Ready rules, which Task 5 completes:
+    - **starting:** for one dead-interval after the cluster is enabled, not ready and translating nothing (drop counter `not-ready`)
+    - **alone:** no peer heard by then → ready
+    - **incumbent:** once ready, stay ready unless fenced or the configs mismatch
+    - **resync:** a node that becomes non-starting while the peer is alive and ready resyncs before it's ready (Task 5)
+    - **simultaneous start:** both peers starting or not ready → the lower node-id becomes ready (the incumbent) and the higher one resyncs from it
 - [ ] **Step 4: Run them to make sure they pass, and run the Phase 1 suite.** Expected: all pass, and `test_cgnat` is still 79.
 - [ ] **Step 5: Commit** `"Cluster: config, HELLO on pair and probe paths, liveness, config hash"`.
 
@@ -142,7 +147,7 @@ def test_probe_path_hello(self):        # cgnat_cluster_path_add_del(local=pg3.l
 - Produces:
   - `u8 cgnat_cluster.active[2]` and `u8 n_active`: the active node ids. It's recomputed by the process, published with a release store, and frozen while `reason == config-mismatch`.
   - `static_always_inline u8 cgnat_owner_node (u32 in_fib_index, u32 in_addr);` uses rendezvous hashing: `score(n) = clib_xxhash (((u64) in_fib_index << 32 | in_addr) ^ (0x9e3779b97f4a7c15ULL * n))`, and the highest score wins. Clustering off → own id.
-  - Active set = {nodes that are alive and ready, self included only if ready}. If that's empty → {self}. Fenced → {peer}.
+  - Active set = {nodes that are alive and ready, self included only if ready}. Fenced → {peer}. If it's empty while starting → {} (drop as `not-ready`). The Task 1 rules guarantee two live nodes never both hold an active set of only themselves.
   - `static_always_inline u32 cgnat_thread_for (u32 in_fib_index, u32 in_addr, u16 first_worker, u16 n_workers);` generalises Phase 1's `cgnat_owner_thread`, which now calls it with the local values. It's used to address the peer's threads.
   - API `cgnat_cluster_owner (in_vrf, in_addr)` → node_id.
   - Fencing: pair path dead and any other path alive and own id > peer id → `fenced = 1`, not ready, reason "fenced".
@@ -206,6 +211,7 @@ def test_steer_large_packet_fragments_and_reassembles(self): # pg2 mtu 1500: 147
   - `void cgnat_sync_session (cgnat_per_thread_t *t, u32 thread_index, cgnat_session_t *s, u8 op);` emits only if the cluster is enabled, the peer is alive and this node owns the subscriber.
   - It's called on: session create (upsert), class change (upsert), touch when `now - last_synced >= refresh_interval` (upsert), and free (delete).
   - Records go to the peer thread `cgnat_thread_for (…, peer_first_worker, peer_n_workers)`, one stream per (local thread, peer thread).
+  - CLI `cgnat cluster window <n>` (default 1024) for tests and tuning.
   - Streams: next seq, `u32 *unacked` (buffer copies, `vlib_buffer_copy`) with send times, highest acked. Window 1024; overflow → drop the oldest, set `want_resync_peer` (sent as `want_resync` in HELLO), count `sync-overflow`.
   - Retransmit unacked packets older than 50 ms on each flush tick.
   - Apply an upsert: find the local map by (in_table_id, in_addr) → else `sync-unknown-map`. Then sub_get create → mapping by (in, in_port, proto): create with the given out_addr/out_port if absent → session upsert (state, class, `last_heard = now - idle_ds/10`, `warm = 1`). Apply a delete: free if present.
@@ -239,17 +245,21 @@ def test_warm_grace(self):                   # warm session with udp timeout 1s,
 **Interfaces:**
 - Consumes: Tasks 1–4.
 - Produces:
-  - Ready condition: alone, or (peer alive, hash equal, not fenced, and resync from the current peer epoch complete).
-  - A node that has never seen the peer starts ready and alone. When the peer appears, it requests a resync and reports reason `resyncing` until done, but keeps owning everything: the peer is not ready either, so the active set stays {self}.
+  - Ready condition: alone, or incumbent (already ready, not fenced, hash equal), or resync from the current peer epoch complete.
+  - A node that leaves `starting` and finds the peer alive and ready sends RESYNC_REQ and reports `resyncing`. Its active set is {peer} until RESYNC_END from all `n_src_threads` arrives; then it's ready and ownership splits.
+  - The incumbent never resyncs from a joining peer. It answers the peer's RESYNC_REQ.
+  - A new peer epoch makes the peer not ready until its HELLO says ready.
   - A resync walk sends every session the node holds (owned or warm), up to 2048 records per thread per run, re-arming itself like the expiry walk.
 
 - [ ] **Step 1: Write the failing tests.** The scapy peer plays node 2.
 
 ```python
 def test_resync_request_answered(self):     # 30 own sessions; inject RESYNC_REQ -> SYNC upserts covering all 30, then RESYNC_END per thread with n_src_threads
-def test_request_resync_on_peer_appear(self): # peer HELLO appears -> RESYNC_REQ on pg2; status reason "resyncing", not ready; inject RESYNC_END (n_src_threads=1) -> ready
+def test_joining_node_resyncs(self):    # peer HELLOs (ready) already flowing when cgnat_cluster_set runs -> after starting: RESYNC_REQ on pg2, reason "resyncing", all owners = peer; inject RESYNC_END (n_src_threads=1) -> ready, owners split
+def test_incumbent_stays_ready(self):   # alone and ready; peer appears ready=0 -> still ready, no RESYNC_REQ sent, all owners self
+def test_simultaneous_start(self):      # peer HELLOs (node 2, ready=0) present during starting -> we (node 1) become ready, send no RESYNC_REQ
 def test_failover_uses_warm_copy(self):     # peer ready (split); inject SYNC upsert for a peer-owned subscriber's session; stop peer HELLOs; after 0.7s the reply to that session's out port on pg1 is translated to the right inside host:port on pg0 (same public port)
-def test_failback_after_resync(self):       # alone; own all; peer appears not-ready, then ready but without RESYNC_END from us... (peer resyncs from us: we answer its RESYNC_REQ) -> only after peer HELLO ready=1 do owners split
+def test_failback_after_resync(self):       # alone, owning all; peer appears ready=0 and sends RESYNC_REQ -> we answer (SYNC + RESYNC_END), owners still all self; peer HELLO ready=1 -> owners split
 def test_peer_fast_restart_resets_streams(self): # peer ready; new epoch in HELLO with no dead gap -> streams reset (next SYNC seq starts at 0), we keep owning all until peer ready again
 ```
 

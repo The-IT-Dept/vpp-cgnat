@@ -21,7 +21,7 @@ memory { main-heap-size 8G }
 buffers { buffers-per-numa 256000 }
 statseg { size 256M }
 plugins { plugin dpdk_plugin.so { disable } }
-cgnat { sessions-per-subscriber 1000 timeouts { udp 3600 } }
+cgnat { sessions-per-subscriber 1000 max-sessions-per-thread 16777216 timeouts { udp 3600 } }
 EOC
 cat > $RUN/setup.cli <<EOC
 create packet-generator interface pg0
@@ -54,13 +54,16 @@ heap() { C show memory main-heap | awk '/used/ {for(i=1;i<=NF;i++) if ($i=="used
 echo "== workers=$W subscribers=$SUBS ports/sub=$PORTS sessions=$N"
 H0=$(C show memory main-heap | grep -m1 -o 'used: [0-9.]*[KMG]' )
 stream new $N
+C clear runtime
 T0=$(date +%s.%N); C packet-generator enable-stream new
-while :; do S=$(sessions); [ "$S" -ge "$N" ] && break; sleep 0.1
-  [ $(echo "$(date +%s.%N) - $T0 > 600" | bc) = 1 ] && break; done
+while :; do S=$(sessions); [ "$S" -ge "$N" ] && break; sleep 0.05
+  [ $(echo "$(date +%s.%N) - $T0 > 300" | bc) = 1 ] && break; done
 T1=$(date +%s.%N)
-echo "new sessions: $S in $(echo "$T1 - $T0" | bc) s = $(echo "$S / ($T1 - $T0)" | bc) sessions/s (wall, incl. CLI polling)"
+C show runtime > $RUN/runtime-new.txt
+echo "new sessions: $S in $(echo "$T1 - $T0" | bc) s = $(echo "$S / ($T1 - $T0)" | bc) sessions/s (wall clock, 50 ms polling)"
+awk '/^Thread/ {t=$2} $1 == "cgnat-in2out" {printf "  creating: thread %-2s cgnat-in2out %7.1f clocks/pkt\n", t, $6}' $RUN/runtime-new.txt
 H1=$(C show memory main-heap | grep -m1 -o 'used: [0-9.]*[KMG]')
-echo "main heap: before $H0, after $H1"
+echo "main heap: before $H0, after $H1  (sessions $S)"
 C packet-generator delete new
 C show errors | grep -i cgnat || true
 
