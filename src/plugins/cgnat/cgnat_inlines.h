@@ -14,18 +14,15 @@
 #include <vnet/fib/ip4_fib.h>
 #include <vppinfra/xxhash.h>
 #include <cgnat/cgnat.h>
+#include <cgnat/cgnat_owner.h>
 
-/* thread owning a subscriber: all its state lives there */
+/* thread owning a subscriber on this node: all its state lives there */
 static_always_inline u32
-cgnat_owner_thread (u32 in_fib_index, u32 in_addr)
+cgnat_owner_thread (u32 in_table_id, u32 in_addr)
 {
   cgnat_main_t *cm = &cgnat_main;
-  u64 h;
-
-  if (PREDICT_TRUE (cm->n_workers <= 1))
-    return cm->n_workers ? cm->first_worker_index : 0;
-  h = clib_xxhash ((u64) in_fib_index << 32 | in_addr);
-  return cm->first_worker_index + h % cm->n_workers;
+  return cgnat_thread_for (in_table_id, in_addr, cm->first_worker_index,
+			   cm->n_workers);
 }
 
 /* next index meaning "hand off to the owner thread" */

@@ -68,6 +68,7 @@ typedef struct
   u8 ready;
   u8 fenced;
   u8 serving; /* data path may translate (owner checks come on top) */
+  u32 active_word; /* active node set, see cgnat_owner.h */
   cgnat_cluster_reason_t reason;
 
   /* startup.conf cluster section, applied at main loop entry */

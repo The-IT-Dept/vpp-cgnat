@@ -156,7 +156,8 @@ cgnat_cluster_evaluate (vlib_main_t *vm, f64 now)
 {
   cgnat_cluster_t *cl = &cgnat_main.cluster;
   cgnat_path_t *p;
-  int starting, dup, mismatch;
+  int starting, dup, mismatch, fence, peer_in;
+  u32 n = 0, a = 0, b = 0;
 
   cl->config_hash = cgnat_config_hash ();
   cl->peer_alive = 0;
@@ -171,6 +172,11 @@ cgnat_cluster_evaluate (vlib_main_t *vm, f64 now)
   dup = cl->dup_last > 0 && now - cl->dup_last < cl->dead_interval;
   mismatch = cl->peer_alive && cl->peer_config_hash != cl->config_hash;
 
+  /* split-brain: only the pair link is down and the peer is visibly
+     alive elsewhere -> the higher id stands down */
+  fence = !cl->pair_alive && cl->peer_alive && cl->node_id > cl->peer_node_id;
+  cl->fenced = 0;
+
   if (dup)
     {
       cl->reason = CGNAT_REASON_DUPLICATE;
@@ -180,6 +186,12 @@ cgnat_cluster_evaluate (vlib_main_t *vm, f64 now)
     {
       cl->reason = CGNAT_REASON_STARTING;
       cl->ready = 0;
+    }
+  else if (fence)
+    {
+      cl->reason = CGNAT_REASON_FENCED;
+      cl->ready = 0;
+      cl->fenced = 1;
     }
   else if (!cl->peer_alive)
     {
@@ -196,7 +208,37 @@ cgnat_cluster_evaluate (vlib_main_t *vm, f64 now)
       cl->reason = CGNAT_REASON_NONE;
       cl->ready = 1;
     }
-  cl->serving = !starting && !dup;
+  /*
+   * Active set.  The peer counts only if we can reach it over the pair
+   * link (that's where steered packets go) and it says it's ready.
+   * Frozen while the configs disagree.
+   */
+  peer_in = cl->peer_alive && cl->pair_alive &&
+	    (cl->peer_state & CGNAT_HELLO_READY) &&
+	    !(cl->peer_state & CGNAT_HELLO_FENCED);
+  if (cl->reason != CGNAT_REASON_CONFIG_MISMATCH)
+    {
+      if (starting || dup)
+	n = 0;
+      else if (cl->fenced)
+	n = 1, a = cl->peer_node_id;
+      else
+	{
+	  if (cl->ready)
+	    a = cl->node_id, n++;
+	  if (peer_in)
+	    {
+	      if (n)
+		b = cl->peer_node_id;
+	      else
+		a = cl->peer_node_id;
+	      n++;
+	    }
+	}
+      __atomic_store_n (&cl->active_word, n | a << 8 | b << 16,
+			__ATOMIC_RELEASE);
+    }
+  cl->serving = (cl->active_word & 0xff) != 0;
 
   vlib_stats_set_gauge (cl->ready_gauge, cl->ready);
   vlib_stats_set_gauge (cl->peer_alive_gauge, cl->peer_alive);

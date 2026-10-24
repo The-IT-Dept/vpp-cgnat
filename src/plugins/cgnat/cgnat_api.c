@@ -8,6 +8,7 @@
 #include <vlibmemory/api.h>
 #include <cgnat/cgnat.h>
 #include <cgnat/cgnat_session.h>
+#include <cgnat/cgnat_owner.h>
 #include <cgnat/cgnat.api_enum.h>
 #include <cgnat/cgnat.api_types.h>
 
@@ -299,6 +300,23 @@ vl_api_cgnat_cluster_path_add_del_t_handler (
   rv = cgnat_cluster_path_add_del (&local, &peer, ntohl (mp->table_id),
 				   mp->is_add);
   REPLY_MACRO (VL_API_CGNAT_CLUSTER_PATH_ADD_DEL_REPLY);
+}
+
+static void
+vl_api_cgnat_cluster_owner_t_handler (vl_api_cgnat_cluster_owner_t *mp)
+{
+  cgnat_main_t *cm = &cgnat_main;
+  vl_api_cgnat_cluster_owner_reply_t *rmp;
+  ip4_address_t in;
+  u8 owner;
+  int rv = 0;
+
+  ip4_address_decode (mp->in_addr, &in);
+  owner = cgnat_owner_node (ntohl (mp->in_vrf), in.as_u32);
+  if (!cm->cluster.enabled)
+    owner = cm->cluster.node_id;
+  REPLY_MACRO2 (VL_API_CGNAT_CLUSTER_OWNER_REPLY,
+		({ rmp->node_id = owner; }));
 }
 
 static void

@@ -208,6 +208,20 @@ autoreply define cgnat_cluster_path_add_del {
   u32 table_id;
 };
 
+/** \brief Which node owns a subscriber (0: none active) */
+define cgnat_cluster_owner {
+  u32 client_index;
+  u32 context;
+  u32 in_vrf;
+  vl_api_ip4_address_t in_addr;
+};
+
+define cgnat_cluster_owner_reply {
+  u32 context;
+  i32 retval;
+  u8 node_id;
+};
+
 define cgnat_cluster_get_status {
   u32 client_index;
   u32 context;

@@ -127,12 +127,14 @@ cgnat_in2out_one (vlib_main_t *vm, vlib_node_runtime_t *node, cgnat_per_thread_t
   rx_fib = ip4_fib_table_get_index_for_sw_if_index (
     vnet_buffer (b)->sw_if_index[VLIB_RX]);
 
-  *owner = cgnat_owner_thread (rx_fib, ip->src_address.as_u32);
-  if (PREDICT_FALSE (*owner != thread_index))
-    return CGNAT_NEXT_HANDOFF;
-
   proto = cgnat_proto_of (ip->protocol);
   map = cgnat_map_by_inside (rx_fib, &ip->src_address);
+  if (PREDICT_TRUE (map != 0))
+    {
+      *owner = cgnat_owner_thread (map->in_table_id, ip->src_address.as_u32);
+      if (PREDICT_FALSE (*owner != thread_index))
+	return CGNAT_NEXT_HANDOFF;
+    }
 
   if (proto == CGNAT_PROTO_ICMP && map)
     {

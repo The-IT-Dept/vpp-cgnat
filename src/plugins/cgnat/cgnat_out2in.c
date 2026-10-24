@@ -171,7 +171,7 @@ cgnat_out2in_one (vlib_main_t *vm, vlib_node_runtime_t *node,
 	b->error = node->errors[CGNAT_OUT2IN_ERROR_NO_MAPPING];
 	return CGNAT_OUT2IN_NEXT_DROP;
       }
-    *owner = cgnat_owner_thread (map->in_fib_index, in.as_u32);
+    *owner = cgnat_owner_thread (map->in_table_id, in.as_u32);
     if (PREDICT_FALSE (*owner != thread_index))
       return CGNAT_NEXT_HANDOFF;
   }

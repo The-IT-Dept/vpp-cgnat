@@ -263,6 +263,88 @@ class TestCgnatClusterHello(CgnatClusterCase):
                                              peer=self.pg3.remote_ip4, table_id=0)
 
 
+class CgnatOwnerCase(CgnatClusterCase):
+    """Long dead interval so ownership can be sampled while the peer is 'alive'."""
+
+    dead_ms = 2000
+
+    def setUp(self):
+        super().setUp()
+        self.cluster_on(dead_interval_ms=self.dead_ms)
+        self.assertTrue(self.wait_for(lambda: self.status().ready, timeout=4))
+
+    def owners(self, n=256):
+        net = ipaddress.ip_network(self.inside_net() + "/24")
+        counts = {}
+        for i in range(n):
+            o = self.vapi.cgnat_cluster_owner(in_vrf=0, in_addr=str(net[i])).node_id
+            counts[o] = counts.get(o, 0) + 1
+        return counts
+
+
+class TestCgnatClusterOwner(CgnatOwnerCase):
+    """Cluster ownership (we are node 1)"""
+
+    def test_owner_alone_is_self(self):
+        """Alone: we own every subscriber"""
+        self.assertEqual(self.owners(), {1: 256})
+
+    def test_owner_split_with_peer(self):
+        """Peer alive and ready: subscribers split between the nodes"""
+        self.keep_hello(0.5)
+        c = self.owners()
+        self.assertEqual(set(c), {1, 2})
+        self.assertTrue(96 <= c[1] <= 160, c)
+
+    def test_owner_peer_not_ready(self):
+        """Peer alive but not ready: we own everyone"""
+        self.keep_hello(0.5, state=0)
+        self.assertEqual(self.owners(), {1: 256})
+
+    def test_takeover_when_all_paths_dead(self):
+        """Peer silent on every path: we own everyone again, ready"""
+        self.keep_hello(0.5)
+        self.assertTrue(self.wait_for(lambda: not self.status().peer_alive, timeout=4))
+        self.assertEqual(self.owners(), {1: 256})
+        self.assertTrue(self.status().ready)
+
+    def test_no_fence_lower_id(self):
+        """Pair link down, peer alive on a probe path, we have the lower id: not fenced"""
+        self.vapi.cgnat_cluster_path_add_del(is_add=1, local=self.pg3.local_ip4,
+                                             peer=self.pg3.remote_ip4, table_id=0)
+        self.keep_hello(1.0, path=1)
+        st = self.status()
+        self.assertTrue(st.peer_alive)
+        self.assertFalse(st.pair_alive)
+        self.assertEqual((st.fenced, st.ready), (False, True))
+        self.assertEqual(self.owners(), {1: 256})
+
+    def test_mismatch_freezes_ownership(self):
+        """Config mismatch: not ready, ownership stays as last agreed"""
+        self.keep_hello(0.5)
+        before = self.owners()
+        self.keep_hello(0.5, config_hash=0xDEADBEEF)
+        st = self.status()
+        self.assertEqual((st.ready, st.reason), (False, "config-mismatch"))
+        self.assertEqual(self.owners(), before)
+
+
+class TestCgnatClusterFence(CgnatOwnerCase):
+    """Cluster fencing (we are node 2, the peer is node 1)"""
+
+    node_id = 2
+    peer_id = 1
+
+    def test_fence_higher_id(self):
+        """Pair link down, peer alive on a probe path, we have the higher id: fenced"""
+        self.vapi.cgnat_cluster_path_add_del(is_add=1, local=self.pg3.local_ip4,
+                                             peer=self.pg3.remote_ip4, table_id=0)
+        self.keep_hello(1.0, path=1)
+        st = self.status()
+        self.assertEqual((st.fenced, st.ready, st.reason), (True, False, "fenced"))
+        self.assertEqual(self.owners(), {1: 256})
+
+
 class TestCgnatClusterStartup(VppTestCase):
     """Cluster from startup.conf"""
 
