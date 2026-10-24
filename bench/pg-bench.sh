@@ -44,18 +44,28 @@ PID=$!
 C() { $VPP/bin/vppctl -s $RUN/cli.sock "$@"; }
 for i in $(seq 50); do [ -S $RUN/cli.sock ] && C show version >/dev/null 2>&1 && break; sleep 0.2; done
 C exec $RUN/setup.cli
-stream() { # name limit
-  local worker=""; [ "$W" -gt 0 ] && worker="worker 0"
-  C packet-generator new "{ name $1 limit $2 size 64-64 interface pg0 node ip4-input $worker data { UDP: 100.64.0.0 - $LAST -> 8.8.8.8 UDP: 1024 - $((1024 + PORTS - 1)) -> 53 length 128 checksum 0 incrementing 1 } }"
+# One stream per worker, each over its own slice of subscribers, the way
+# NIC RSS spreads traffic: every worker polls an input (as with real NICs)
+# and about (W-1)/W of its packets belong to subscribers owned elsewhere.
+ip_of() { printf '100.64.%d.%d' $(( $1 >> 8 )) $(( $1 & 255 )); }
+NS=$(( W > 0 ? W : 1 )); SLICE=$(( SUBS / NS ))
+streams() { # prefix total_limit
+  for i in $(seq 0 $((NS - 1))); do
+    local worker=""; [ "$W" -gt 0 ] && worker="worker $i"
+    C packet-generator new "{ name $1$i limit $(( $2 / NS )) size 64-64 interface pg0 node ip4-input $worker data { UDP: $(ip_of $((i * SLICE))) - $(ip_of $(((i + 1) * SLICE - 1))) -> 8.8.8.8 UDP: 1024 - $((1024 + PORTS - 1)) -> 53 length 128 checksum 0 incrementing 1 } }"
+  done
 }
+enable() { for i in $(seq 0 $((NS - 1))); do C packet-generator enable-stream $1$i; done; }
+disable() { for i in $(seq 0 $((NS - 1))); do C packet-generator disable-stream $1$i; done; }
+delete() { for i in $(seq 0 $((NS - 1))); do C packet-generator delete $1$i; done; }
 sessions() { C show cgnat status | sed -n 's/.*sessions \([0-9]*\).*/\1/p'; }
 heap() { C show memory main-heap | awk '/used/ {for(i=1;i<=NF;i++) if ($i=="used:") {print $(i+1); exit}}'; }
 
 echo "== workers=$W subscribers=$SUBS ports/sub=$PORTS sessions=$N"
 H0=$(C show memory main-heap | grep -m1 -o 'used: [0-9.]*[KMG]' )
-stream new $N
+streams new $N
 C clear runtime
-T0=$(date +%s.%N); C packet-generator enable-stream new
+T0=$(date +%s.%N); enable new
 while :; do S=$(sessions); [ "$S" -ge "$N" ] && break; sleep 0.05
   [ $(echo "$(date +%s.%N) - $T0 > 300" | bc) = 1 ] && break; done
 T1=$(date +%s.%N)
@@ -64,15 +74,16 @@ echo "new sessions: $S in $(echo "$T1 - $T0" | bc) s = $(echo "$S / ($T1 - $T0)"
 awk '/^Thread/ {t=$2} $1 == "cgnat-in2out" {printf "  creating: thread %-2s cgnat-in2out %7.1f clocks/pkt\n", t, $6}' $RUN/runtime-new.txt
 H1=$(C show memory main-heap | grep -m1 -o 'used: [0-9.]*[KMG]')
 echo "main heap: before $H0, after $H1  (sessions $S)"
-C packet-generator delete new
+delete new
 C show errors | grep -i cgnat || true
 
 # established flows: replay the same flows for 10 s
-stream est $((N * 1000))
-C clear runtime; C packet-generator enable-stream est; sleep 10
-C show runtime > $RUN/runtime.txt; C packet-generator disable-stream est
+streams est $((N * 1000))
+C clear runtime; enable est; sleep 10
+C show runtime > $RUN/runtime.txt; disable est
 echo "--- established flows (10 s): per node (thread, vectors/s, clocks/packet)"
 awk '/^Thread/ {t=$2} $1 ~ /^(cgnat-in2out|ip4-input|ip4-lookup|ip4-rewrite|pg-input)$/ {printf "  thread %-2s %-14s %12d pkts %10.0f pps  %7.1f clocks/pkt  %6.1f pkts/call\n", t, $1, $4, $4/10, $6, $7}' $RUN/runtime.txt
 grep -E "vector rates|Time" $RUN/runtime.txt | head -8
 C show errors | grep -i -E "cgnat|drop" || true
+awk '/^Thread/ {t=$2} $1 == "cgnat-in2out" {n += $4} END {printf "TOTAL cgnat-in2out: %.0f pps\n", n/10}' $RUN/runtime.txt
 kill $PID; wait $PID 2>/dev/null || true

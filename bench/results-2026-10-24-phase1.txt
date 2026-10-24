@@ -1,0 +1,168 @@
+== workers=1 subscribers=1024 ports/sub=15 sessions=15360
+new sessions: 15360 in .093132302 s = 164926 sessions/s (wall clock, 50 ms polling)
+  creating: thread 1  cgnat-in2out  3420.0 clocks/pkt
+main heap: before used: 395.98M, after used: 397.40M  (sessions 15360)
+--- established flows (10 s): per node (thread, vectors/s, clocks/packet)
+  thread 1  cgnat-in2out       15360000 pkts    1536000 pps   1180.0 clocks/pkt   256.0 pkts/call
+  thread 1  ip4-input          15360000 pkts    1536000 pps     49.1 clocks/pkt   256.0 pkts/call
+  thread 1  ip4-lookup         15360000 pkts    1536000 pps     31.6 clocks/pkt   256.0 pkts/call
+  thread 1  ip4-rewrite        15360000 pkts    1536000 pps     34.2 clocks/pkt   256.0 pkts/call
+  thread 1  pg-input           15360000 pkts    1536000 pps     64.2 clocks/pkt   256.0 pkts/call
+Time 10.0, 10.000000 sec internal node vector rate 0.00 loops/sec 206955.32
+  vector rates in 0.0000e0, out 0.0000e0, drop 0.0000e0, punt 0.0000e0
+Time 10.0, 10.000000 sec internal node vector rate 0.00 loops/sec 642109.82
+  vector rates in 1.5332e6, out 1.5332e6, drop 0.0000e0, punt 0.0000e0
+TOTAL cgnat-in2out: 1536000 pps
+== workers=1 subscribers=16384 ports/sub=61 sessions=999424
+new sessions: 999424 in 2.606416401 s = 383447 sessions/s (wall clock, 50 ms polling)
+  creating: thread 1  cgnat-in2out  6270.0 clocks/pkt
+main heap: before used: 395.98M, after used: 611.55M  (sessions 999424)
+--- established flows (10 s): per node (thread, vectors/s, clocks/packet)
+  thread 1  cgnat-in2out       12190976 pkts    1219098 pps   1850.0 clocks/pkt   256.0 pkts/call
+  thread 1  ip4-input          12190976 pkts    1219098 pps     51.0 clocks/pkt   256.0 pkts/call
+  thread 1  ip4-lookup         12190976 pkts    1219098 pps     38.5 clocks/pkt   256.0 pkts/call
+  thread 1  ip4-rewrite        12190976 pkts    1219098 pps     36.1 clocks/pkt   256.0 pkts/call
+  thread 1  pg-input           12190976 pkts    1219098 pps     69.8 clocks/pkt   256.0 pkts/call
+Time 10.0, 10.000000 sec internal node vector rate 0.00 loops/sec 213665.62
+  vector rates in 0.0000e0, out 0.0000e0, drop 0.0000e0, punt 0.0000e0
+Time 10.0, 10.000000 sec internal node vector rate 256.00 loops/sec 4744.32
+  vector rates in 1.2158e6, out 1.2158e6, drop 0.0000e0, punt 0.0000e0
+TOTAL cgnat-in2out: 1219098 pps
+== workers=2 subscribers=1024 ports/sub=15 sessions=15360
+new sessions: 15360 in .109197772 s = 140662 sessions/s (wall clock, 50 ms polling)
+  creating: thread 1  cgnat-in2out  5100.0 clocks/pkt
+  creating: thread 2  cgnat-in2out  4270.0 clocks/pkt
+main heap: before used: 474.45M, after used: 475.81M  (sessions 15360)
+--- established flows (10 s): per node (thread, vectors/s, clocks/packet)
+  thread 1  cgnat-in2out       10249975 pkts    1024998 pps    776.0 clocks/pkt   249.7 pkts/call
+  thread 1  ip4-input           7680000 pkts     768000 pps     65.7 clocks/pkt   256.0 pkts/call
+  thread 1  ip4-lookup          6289975 pkts     628998 pps     56.3 clocks/pkt   153.2 pkts/call
+  thread 1  ip4-rewrite         6289975 pkts     628998 pps     63.5 clocks/pkt   153.2 pkts/call
+  thread 1  pg-input            7680000 pkts     768000 pps     79.6 clocks/pkt   256.0 pkts/call
+  thread 2  cgnat-in2out        8874204 pkts     887420 pps    999.0 clocks/pkt   232.6 pkts/call
+  thread 2  ip4-input           7680000 pkts     768000 pps     53.5 clocks/pkt   256.0 pkts/call
+  thread 2  ip4-lookup          5049204 pkts     504920 pps     41.2 clocks/pkt   132.3 pkts/call
+  thread 2  ip4-rewrite         5049204 pkts     504920 pps     41.2 clocks/pkt   132.3 pkts/call
+  thread 2  pg-input            7680000 pkts     768000 pps     79.9 clocks/pkt   256.0 pkts/call
+Time 10.0, 10.000000 sec internal node vector rate 0.00 loops/sec 295087.15
+  vector rates in 0.0000e0, out 0.0000e0, drop 0.0000e0, punt 0.0000e0
+Time 10.0, 10.000000 sec internal node vector rate 0.00 loops/sec 532587.40
+  vector rates in 7.6558e5, out 6.2701e5, drop 0.0000e0, punt 0.0000e0
+Time 10.0, 10.000000 sec internal node vector rate 0.00 loops/sec 695088.86
+  vector rates in 7.6558e5, out 5.0332e5, drop 0.0000e0, punt 0.0000e0
+   2765796            cgnat-in2out                    handoff queue full           error  
+   1255025            cgnat-in2out                    handoff queue full           error  
+TOTAL cgnat-in2out: 1912418 pps
+== workers=2 subscribers=16384 ports/sub=61 sessions=999424
+new sessions: 967343 in 300.035569470 s = 3224 sessions/s (wall clock, 50 ms polling)
+  creating: thread 1  cgnat-in2out  4250.0 clocks/pkt
+  creating: thread 2  cgnat-in2out  4240.0 clocks/pkt
+main heap: before used: 474.45M, after used: 666.42M  (sessions 967343)
+     25818            cgnat-in2out                    handoff queue full           error  
+      6263            cgnat-in2out                    handoff queue full           error  
+--- established flows (10 s): per node (thread, vectors/s, clocks/packet)
+  thread 1  cgnat-in2out       16117054 pkts    1611705 pps   1330.0 clocks/pkt   235.9 pkts/call
+  thread 1  ip4-input          12577792 pkts    1257779 pps     61.4 clocks/pkt   256.0 pkts/call
+  thread 1  ip4-lookup          9712990 pkts     971299 pps     52.8 clocks/pkt   142.2 pkts/call
+  thread 1  ip4-rewrite         9712990 pkts     971299 pps     53.1 clocks/pkt   142.2 pkts/call
+  thread 1  pg-input           12577792 pkts    1257779 pps     91.6 clocks/pkt   256.0 pkts/call
+  thread 2  cgnat-in2out       13138718 pkts    1313872 pps   1670.0 clocks/pkt   243.4 pkts/call
+  thread 2  ip4-input           7653120 pkts     765312 pps     81.1 clocks/pkt   256.0 pkts/call
+  thread 2  ip4-lookup          9255156 pkts     925516 pps     64.6 clocks/pkt   171.4 pkts/call
+  thread 2  ip4-rewrite         9255156 pkts     925516 pps     75.6 clocks/pkt   171.4 pkts/call
+  thread 2  pg-input            7653120 pkts     765312 pps     99.7 clocks/pkt   256.0 pkts/call
+Time 10.0, 10.000000 sec internal node vector rate 0.00 loops/sec 262515.30
+  vector rates in 0.0000e0, out 0.0000e0, drop 0.0000e0, punt 0.0000e0
+Time 10.0, 10.000000 sec internal node vector rate 174.48 loops/sec 6157.19
+  vector rates in 1.2544e6, out 9.6874e5, drop 0.0000e0, punt 0.0000e0
+Time 10.0, 10.000000 sec internal node vector rate 225.43 loops/sec 1462.45
+  vector rates in 7.6329e5, out 9.2308e5, drop 0.0000e0, punt 0.0000e0
+    937449            cgnat-in2out                    handoff queue full           error  
+    350441            cgnat-in2out                    handoff queue full           error  
+TOTAL cgnat-in2out: 2925577 pps
+== workers=4 subscribers=1024 ports/sub=15 sessions=15360
+new sessions: 15360 in .026443743 s = 580855 sessions/s (wall clock, 50 ms polling)
+  creating: thread 1  cgnat-in2out  3110.0 clocks/pkt
+  creating: thread 2  cgnat-in2out  2680.0 clocks/pkt
+  creating: thread 3  cgnat-in2out  2630.0 clocks/pkt
+  creating: thread 4  cgnat-in2out  2830.0 clocks/pkt
+main heap: before used: 631.81M, after used: 633.43M  (sessions 15360)
+--- established flows (10 s): per node (thread, vectors/s, clocks/packet)
+  thread 1  cgnat-in2out        6818339 pkts     681834 pps    577.0 clocks/pkt   203.0 pkts/call
+  thread 1  ip4-input           3840000 pkts     384000 pps     71.4 clocks/pkt   256.0 pkts/call
+  thread 1  ip4-lookup          3908339 pkts     390834 pps     50.0 clocks/pkt   116.4 pkts/call
+  thread 1  ip4-rewrite         3908339 pkts     390834 pps     47.3 clocks/pkt   116.4 pkts/call
+  thread 1  pg-input            3840000 pkts     384000 pps     74.7 clocks/pkt   256.0 pkts/call
+  thread 2  cgnat-in2out        5901483 pkts     590148 pps    665.0 clocks/pkt   194.3 pkts/call
+  thread 2  ip4-input           3840000 pkts     384000 pps     68.2 clocks/pkt   256.0 pkts/call
+  thread 2  ip4-lookup          3066483 pkts     306648 pps     47.4 clocks/pkt   101.0 pkts/call
+  thread 2  ip4-rewrite         3066483 pkts     306648 pps     45.6 clocks/pkt   101.0 pkts/call
+  thread 2  pg-input            3840000 pkts     384000 pps     83.6 clocks/pkt   256.0 pkts/call
+  thread 3  cgnat-in2out        5129806 pkts     512981 pps    809.0 clocks/pkt   181.0 pkts/call
+  thread 3  ip4-input           3840000 pkts     384000 pps     53.9 clocks/pkt   256.0 pkts/call
+  thread 3  ip4-lookup          2189806 pkts     218981 pps     46.9 clocks/pkt    77.3 pkts/call
+  thread 3  ip4-rewrite         2189806 pkts     218981 pps     47.7 clocks/pkt    77.3 pkts/call
+  thread 3  pg-input            3840000 pkts     384000 pps     89.6 clocks/pkt   256.0 pkts/call
+  thread 4  cgnat-in2out        6442390 pkts     644239 pps    557.0 clocks/pkt   205.7 pkts/call
+  thread 4  ip4-input           3840000 pkts     384000 pps     70.3 clocks/pkt   256.0 pkts/call
+  thread 4  ip4-lookup          3667390 pkts     366739 pps     57.2 clocks/pkt   117.1 pkts/call
+  thread 4  ip4-rewrite         3667390 pkts     366739 pps     57.0 clocks/pkt   117.1 pkts/call
+  thread 4  pg-input            3840000 pkts     384000 pps     76.1 clocks/pkt   256.0 pkts/call
+Time 10.0, 10.000000 sec internal node vector rate 0.00 loops/sec 195907.03
+  vector rates in 0.0000e0, out 0.0000e0, drop 0.0000e0, punt 0.0000e0
+Time 10.0, 10.000000 sec internal node vector rate 0.00 loops/sec 310526.85
+  vector rates in 3.8237e5, out 3.8918e5, drop 0.0000e0, punt 0.0000e0
+Time 10.0, 10.000000 sec internal node vector rate 0.00 loops/sec 893180.96
+  vector rates in 3.8237e5, out 3.0535e5, drop 0.0000e0, punt 0.0000e0
+Time 10.0, 10.000000 sec internal node vector rate 0.00 loops/sec 1790923.53
+  vector rates in 3.8237e5, out 2.1805e5, drop 0.0000e0, punt 0.0000e0
+    859625            cgnat-in2out                    handoff queue full           error  
+    396013            cgnat-in2out                    handoff queue full           error  
+    212653            cgnat-in2out                    handoff queue full           error  
+   1059691            cgnat-in2out                    handoff queue full           error  
+TOTAL cgnat-in2out: 2429202 pps
+== workers=4 subscribers=16384 ports/sub=61 sessions=999424
+new sessions: 988864 in 300.029028471 s = 3295 sessions/s (wall clock, 50 ms polling)
+  creating: thread 1  cgnat-in2out  3850.0 clocks/pkt
+  creating: thread 2  cgnat-in2out  3690.0 clocks/pkt
+  creating: thread 3  cgnat-in2out  3460.0 clocks/pkt
+  creating: thread 4  cgnat-in2out  3380.0 clocks/pkt
+main heap: before used: 631.81M, after used: 768.40M  (sessions 988864)
+       509            cgnat-in2out                    handoff queue full           error  
+      2260            cgnat-in2out                    handoff queue full           error  
+      2208            cgnat-in2out                    handoff queue full           error  
+      5583            cgnat-in2out                    handoff queue full           error  
+--- established flows (10 s): per node (thread, vectors/s, clocks/packet)
+  thread 1  cgnat-in2out       12688709 pkts    1268871 pps   1750.0 clocks/pkt   253.8 pkts/call
+  thread 1  ip4-input           4320512 pkts     432051 pps    125.0 clocks/pkt   256.0 pkts/call
+  thread 1  ip4-lookup          9445179 pkts     944518 pps     75.4 clocks/pkt   188.9 pkts/call
+  thread 1  ip4-rewrite         9445179 pkts     944518 pps     94.6 clocks/pkt   188.9 pkts/call
+  thread 1  pg-input            4320512 pkts     432051 pps     98.5 clocks/pkt   256.0 pkts/call
+  thread 2  cgnat-in2out       19914978 pkts    1991498 pps   1060.0 clocks/pkt   197.2 pkts/call
+  thread 2  ip4-input          12579072 pkts    1257907 pps     78.0 clocks/pkt   256.0 pkts/call
+  thread 2  ip4-lookup         10511382 pkts    1051138 pps     54.4 clocks/pkt   104.1 pkts/call
+  thread 2  ip4-rewrite        10511382 pkts    1051138 pps     52.4 clocks/pkt   104.1 pkts/call
+  thread 2  pg-input           12579072 pkts    1257907 pps     92.9 clocks/pkt   256.0 pkts/call
+  thread 3  cgnat-in2out       20942460 pkts    2094246 pps    996.0 clocks/pkt   192.0 pkts/call
+  thread 3  ip4-input          14035456 pkts    1403546 pps     72.3 clocks/pkt   256.0 pkts/call
+  thread 3  ip4-lookup         10422760 pkts    1042276 pps     54.1 clocks/pkt    95.6 pkts/call
+  thread 3  ip4-rewrite        10422760 pkts    1042276 pps     53.1 clocks/pkt    95.6 pkts/call
+  thread 3  pg-input           14035456 pkts    1403546 pps     95.5 clocks/pkt   256.0 pkts/call
+  thread 4  cgnat-in2out       20072513 pkts    2007251 pps   1050.0 clocks/pkt   199.2 pkts/call
+  thread 4  ip4-input          12284928 pkts    1228493 pps     81.0 clocks/pkt   256.0 pkts/call
+  thread 4  ip4-lookup         10771819 pkts    1077182 pps     54.9 clocks/pkt   106.9 pkts/call
+  thread 4  ip4-rewrite        10771819 pkts    1077182 pps     51.6 clocks/pkt   106.9 pkts/call
+  thread 4  pg-input           12284928 pkts    1228493 pps     93.3 clocks/pkt   256.0 pkts/call
+Time 10.0, 10.000000 sec internal node vector rate 0.00 loops/sec 192865.54
+  vector rates in 0.0000e0, out 0.0000e0, drop 0.0000e0, punt 0.0000e0
+Time 10.0, 10.000000 sec internal node vector rate 206.81 loops/sec 1646.44
+  vector rates in 4.3061e5, out 9.4138e5, drop 0.0000e0, punt 0.0000e0
+Time 10.0, 10.000000 sec internal node vector rate 162.26 loops/sec 3422.58
+  vector rates in 1.2537e6, out 1.0476e6, drop 0.0000e0, punt 0.0000e0
+Time 10.0, 10.000000 sec internal node vector rate 135.39 loops/sec 6004.28
+  vector rates in 1.3988e6, out 1.0388e6, drop 0.0000e0, punt 0.0000e0
+     46948            cgnat-in2out                    handoff queue full           error  
+    651319            cgnat-in2out                    handoff queue full           error  
+    710256            cgnat-in2out                    handoff queue full           error  
+    669114            cgnat-in2out                    handoff queue full           error  
+TOTAL cgnat-in2out: 7361866 pps
