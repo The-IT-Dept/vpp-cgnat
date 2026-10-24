@@ -5,7 +5,7 @@ A carrier-grade NAT plugin for [VPP](https://fd.io), built around
 commodity servers.
 
 > **Status:** the single node (Phase 1) and the active/active pair (Phase 2) are
-> done, tested in VPP's `make test` (171 tests) and in a two-VPP lab with real
+> done, tested in VPP's `make test` (174 tests) and in a two-VPP lab with real
 > TCP/UDP flows and kill/restore, and running in production in front of an ISP
 > core router on SR-IOV VFs: about 2.0 Mpps lossless and 2.9 Mpps peak on two
 > worker cores. See
@@ -102,7 +102,7 @@ static routes with BFD-checked next hops, ECMP, and
 line (IPoE via the MX's BNG, CGNAT VRF):
 
 - **On virtio (2026-10-24):** a 792 MB HTTP download completed byte-perfect over one TCP connection while node 1 was killed with `kill -9` mid-transfer, restarted and rejoined, and then node 2 was killed. The connection kept the same public IP:port throughout. A 1-second ping through the same line lost 4 of 150 packets across the four events.
-- **On SR-IOV VFs (2026-10-25):** an 800,000,000-byte download completed byte-perfect through kill, rejoin and kill, with the same public IP:port. A 0.2 s ping lost 0.6 s when the subscriber's owner was killed and 0.4 s when the other node was. Rejoins on VFs exposed three start-up timing gaps that virtio hid; they and their fixes are in [docs/sriov.md](docs/sriov.md#failover-lessons-from-vfs).
+- **On SR-IOV VFs (2026-10-25):** the owner was killed, rejoined, and then the other node was killed. An 800 MB download from our server and the Debian ISO from a public mirror each completed with SHA-256 intact, over one TCP connection with the same public IP:port. A 0.2 s ping lost 0.6 s at the owner's kill, nothing at the rejoin, and 0.2 s at the second kill. Getting there on VFs took fixes for three start-up timing gaps that virtio hid: see [docs/sriov.md](docs/sriov.md#failover-lessons-from-vfs).
 
 **Dual sessions, shown on the live pair:** two subscribers whose owners are
 different nodes, each node's table dumped over the API:
@@ -159,7 +159,7 @@ cd ~/vpp && make build                      # or make build-release
 ```
 
 The test suites run in VPP's own framework: `test/test_cgnat.py` (79 tests,
-the single node with 0 and 2 workers) and `test/test_cgnat_cluster.py` (92
+the single node with 0 and 2 workers) and `test/test_cgnat_cluster.py` (94
 tests, the pair against a scapy-emulated peer). VPP needs
 `patches/vpp-26.06-dpdk-vlan-strip.patch` only for SR-IOV VFs with
 host-enforced VLANs. `scripts/remote.sh` syncs to

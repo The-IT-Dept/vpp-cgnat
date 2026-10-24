@@ -79,14 +79,23 @@ service, so a package upgrade that restarts VPP can't leave it stopped.
 
 ## Measured failover on VFs
 
-A 0.2 s ping and a long HTTP download ran through a real subscriber line,
-while each node in turn was killed with `kill -9`:
+A 0.2 s ping and a long HTTP download ran through a real subscriber line. The
+subscriber's owner node was killed with `kill -9` and came back by itself
+(systemd); 30 s after it rejoined, the other node was killed.
 
-| event | ping lost | download |
+| event | before the three fixes | after |
 |---|---|---|
-| kill the subscriber's owner | 3 pings (0.6 s) | kept |
-| kill the other node | 2 pings (0.4 s) | kept |
-| restarted node rejoins (before fix 3) | 17 pings (3.4 s) | kept (TCP recovers) |
+| kill the subscriber's owner | 3 pings (0.6 s) | 3 pings (0.6 s) |
+| the restarted node rejoins | 17 pings (3.4 s) | **none** |
+| kill the other node | 2 pings (0.4 s) | 1 ping (0.2 s) |
+| upgrading a node (`deploy rollout`) | 3.2 s mid-install, 33 s resync | 0.4 s at stop, none at rejoin, resync 0.1 s |
 
-- **The download:** 800,000,000 bytes completed byte-perfect over one TCP connection, with the same public IP:port, through kill, rejoin and kill.
-- **A public HTTP mirror closed the connection** (a clean FIN mid-body) after the multi-second rejoin stall, every time. Our own test server rode through the same stall. Fix 3 removes the stall.
+Downloads on the final build, each over one TCP connection that kept the same
+public IP:port through kill, rejoin and kill:
+
+- **Our own server:** an 800,000,000-byte file, SHA-256 identical to the source.
+- **A public mirror** (the Debian 13.7 netinst ISO from AARNet): 792,723,456 bytes, SHA-256 matching Debian's published `SHA256SUMS`. Before the fixes, this mirror closed the connection (a clean FIN mid-body) after the 3.4 s rejoin stall, every time. Our own server rode that stall out.
+
+During the downloads the ping also lost occasional single packets, because
+the download filled the subscriber line. Those are queueing on the access
+line, not failover.
