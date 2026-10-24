@@ -103,6 +103,33 @@ line (IPoE via the MX's BNG, CGNAT VRF):
 - The connection kept the same public IP:port throughout.
 - A 1-second ping through the same line lost 4 of 150 packets across the four events.
 
+**Dual sessions, shown on the live pair:** two subscribers whose owners are
+different nodes, each node's table dumped over the API:
+
+| subscriber | owner | node 1 | node 2 |
+|---|---|---|---|
+| 100.64.0.1 | node 1 | 2 sessions, owned | the same 2, warm |
+| 100.64.0.6 | node 2 | the same 5, warm | 5 sessions, owned |
+
+Both nodes held the identical 7 sessions with the same public IP:port.
+
+**DPDK in the VMs (production node, Proxmox virtio).** The test used a node
+with 2 workers on pinned host cores, DPDK `vfio-pci` on 2-queue virtio NICs,
+and VLANs through the host's OVS bridge. A DPDK generator VM sent 64-byte UDP
+from 4096 subscribers × 63 flows through a test map:
+
+| offered | through the CGNAT | note |
+|---|---|---|
+| 130 kpps | 100% | |
+| 280 kpps | 100% | lossless ceiling |
+| 500 kpps | 85% (426 kpps) | |
+| 700–850 kpps | about 20% | every packet received and translated, then dropped at virtio TX |
+
+- **Where it stops:** the bottleneck is the host's vhost-net/OVS kernel path, not VPP. Every drop was a DPDK virtio TX failure on the output NIC, with no `rx-miss` on input.
+- **VPP's headroom:** the CGNAT workers ran at about 1,100–1,500 clocks per packet with vectors far from full. The translation itself has several times that headroom on these two workers.
+- **What 280 kpps lossless means:** roughly 2 Gb/s of typical traffic at an average of about 900 bytes per packet.
+- **Going faster:** for line rate, give the VMs SR-IOV VFs (or OVS-DPDK/vhost-user) instead of vhost-net.
+
 ## Performance (single node, packet generator)
 
 Release build on an 8-vCPU VM on a busy shared host, VPP's packet generator,
