@@ -177,6 +177,18 @@ show_cgnat_sessions_fn (vlib_main_t *vm, unformat_input_t *input,
   cgnat_main_t *cm = &cgnat_main;
   f64 now = vlib_time_now (vm);
   cgnat_per_thread_t *t;
+  ip4_address_t sub = {};
+  u32 vrf = 0, fib_index = ~0;
+  int filter = 0;
+
+  if (unformat (input, "subscriber %U", unformat_ip4_address, &sub))
+    {
+      unformat (input, "inside-vrf %u", &vrf);
+      fib_index = fib_table_find (FIB_PROTOCOL_IP4, vrf);
+      if (fib_index == ~0)
+	return clib_error_return (0, "no vrf %u", vrf);
+      filter = 1;
+    }
 
   vec_foreach (t, cm->per_thread)
     {
@@ -185,6 +197,9 @@ show_cgnat_sessions_fn (vlib_main_t *vm, unformat_input_t *input,
       pool_foreach (s, t->sessions_pool)
 	{
 	  cgnat_mapping_t *m = pool_elt_at_index (t->mappings, s->mapping_index);
+	  if (filter && (m->in_fib_index != fib_index ||
+			 m->in_addr.as_u32 != sub.as_u32))
+	    continue;
 	  vlib_cli_output (
 	    vm,
 	    "thread %u %s %U:%u fib %u -> %U:%u <-> %U:%u %s idle %.0fs",
@@ -202,7 +217,7 @@ show_cgnat_sessions_fn (vlib_main_t *vm, unformat_input_t *input,
 
 VLIB_CLI_COMMAND (show_cgnat_sessions_command, static) = {
   .path = "show cgnat sessions",
-  .short_help = "show cgnat sessions",
+  .short_help = "show cgnat sessions [subscriber <addr> [inside-vrf <n>]]",
   .function = show_cgnat_sessions_fn,
 };
 
@@ -296,4 +311,37 @@ VLIB_CLI_COMMAND (cgnat_timeouts_command, static) = {
   .short_help = "cgnat timeouts [tcp-established <s>] [tcp-transitory <s>] "
 		"[udp <s>] [icmp <s>]",
   .function = cgnat_timeouts_fn,
+};
+
+static clib_error_t *
+show_cgnat_status_fn (vlib_main_t *vm, unformat_input_t *input,
+		      vlib_cli_command_t *cmd)
+{
+  cgnat_main_t *cm = &cgnat_main;
+
+  vlib_cli_output (vm, "maps %u, subscribers %lu, mappings %lu, sessions %lu",
+		   pool_elts (cm->maps),
+		   cgnat_counter_total (CGNAT_COUNTER_SUBSCRIBERS),
+		   cgnat_counter_total (CGNAT_COUNTER_MAPPINGS),
+		   cgnat_counter_total (CGNAT_COUNTER_SESSIONS));
+  vlib_cli_output (vm, "filtering %s, sessions per subscriber %u",
+		   cm->endpoint_independent_filtering ?
+		     "endpoint-independent" :
+		     "address-dependent",
+		   cm->sessions_per_sub);
+  vlib_cli_output (vm,
+		   "timeouts: tcp-established %us tcp-transitory %us udp %us "
+		   "icmp %us",
+		   cm->timeouts[CGNAT_TO_TCP_EST],
+		   cm->timeouts[CGNAT_TO_TCP_TRANS], cm->timeouts[CGNAT_TO_UDP],
+		   cm->timeouts[CGNAT_TO_ICMP]);
+  vlib_cli_output (vm, "threads: %u workers from %u", cm->n_workers,
+		   cm->first_worker_index);
+  return 0;
+}
+
+VLIB_CLI_COMMAND (show_cgnat_status_command, static) = {
+  .path = "show cgnat status",
+  .short_help = "show cgnat status",
+  .function = show_cgnat_status_fn,
 };

@@ -33,6 +33,23 @@ typedef enum
   CGNAT_N_TO,
 } cgnat_to_class_t;
 
+/* stats segment counters, /cgnat/<name> */
+#define foreach_cgnat_counter                                                 \
+  _ (IN2OUT_PACKETS, "in2out-packets")                                        \
+  _ (OUT2IN_PACKETS, "out2in-packets")                                        \
+  _ (HAIRPIN_PACKETS, "hairpin-packets")                                      \
+  _ (SESSIONS, "sessions")                                                    \
+  _ (MAPPINGS, "mappings")                                                    \
+  _ (SUBSCRIBERS, "subscribers")
+
+typedef enum
+{
+#define _(sym, name) CGNAT_COUNTER_##sym,
+  foreach_cgnat_counter
+#undef _
+    CGNAT_N_COUNTER,
+} cgnat_counter_t;
+
 /* An endpoint-independent mapping: inside ip:port:proto <-> outside port */
 typedef struct
 {
@@ -111,6 +128,13 @@ typedef struct
   u32 sessions_per_sub;
   u8 endpoint_independent_filtering;
 
+  /*
+   * Stats.  Packet counters, and gauges kept per thread (each thread
+   * only ever increments/decrements its own slot, so per-thread values
+   * are never negative and their sum is the total).
+   */
+  vlib_simple_counter_main_t counters[CGNAT_N_COUNTER];
+
   /* interfaces with translation enabled */
   uword *inside_ifs;
   uword *outside_ifs;
@@ -126,6 +150,19 @@ extern cgnat_main_t cgnat_main;
 extern vlib_node_registration_t cgnat_in2out_node;
 extern vlib_node_registration_t cgnat_out2in_node;
 extern vlib_node_registration_t cgnat_hairpin_node;
+
+static_always_inline void
+cgnat_gauge (u32 thread_index, cgnat_counter_t c, int delta)
+{
+  if (delta > 0)
+    vlib_increment_simple_counter (&cgnat_main.counters[c], thread_index, 0,
+				   delta);
+  else
+    vlib_decrement_simple_counter (&cgnat_main.counters[c], thread_index, 0,
+				   -delta);
+}
+
+u64 cgnat_counter_total (cgnat_counter_t c);
 
 int cgnat_interface_add_del (u32 sw_if_index, int is_inside, int is_add);
 void cgnat_map_flush (u32 map_index);

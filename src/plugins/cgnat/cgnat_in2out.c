@@ -238,7 +238,7 @@ VLIB_NODE_FN (cgnat_in2out_node)
   u32 nexts[VLIB_FRAME_SIZE], *next = nexts;
   u16 owners[VLIB_FRAME_SIZE], *owner = owners;
   u32 *from = vlib_frame_vector_args (frame);
-  u32 n_left = frame->n_vectors, n_drop;
+  u32 n_left = frame->n_vectors, n_drop, n_ok = 0;
   f64 now = vlib_time_now (vm);
 
   vlib_get_buffers (vm, from, bufs, n_left);
@@ -259,11 +259,14 @@ VLIB_NODE_FN (cgnat_in2out_node)
 	  tr->mapping_index = m ? m - t->mappings : ~0;
 	  tr->session_index = s ? s - t->sessions_pool : ~0;
 	}
+      n_ok += m != 0; /* translated */
       b++;
       next++;
       owner++;
       n_left--;
     }
+  vlib_increment_simple_counter (
+    &cm->counters[CGNAT_COUNTER_IN2OUT_PACKETS], thread_index, 0, n_ok);
   n_drop = cgnat_dispatch (vm, node, from, nexts, owners, frame->n_vectors,
 			   cm->fq_in2out_index);
   if (n_drop)

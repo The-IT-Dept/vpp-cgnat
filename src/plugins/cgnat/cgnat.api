@@ -116,3 +116,55 @@ autoreply define cgnat_set_timeouts {
   u32 udp;
   u32 icmp;
 };
+
+/** \brief Dump sessions: all, or one subscriber's
+    @param all - every session if true
+    @param in_vrf / in_addr - the subscriber, if not all
+*/
+define cgnat_session_dump {
+  u32 client_index;
+  u32 context;
+  bool all;
+  u32 in_vrf;
+  vl_api_ip4_address_t in_addr;
+};
+
+/** \brief A session
+    @param proto - IP protocol number (6, 17, 1)
+    @param timeout_class - tcp-established, tcp-transitory, udp or icmp
+    @param idle - seconds since the session last saw traffic
+*/
+define cgnat_session_details {
+  u32 context;
+  u32 thread_index;
+  u32 in_vrf;
+  vl_api_ip4_address_t in_addr;
+  u16 in_port;
+  vl_api_ip4_address_t out_addr;
+  u16 out_port;
+  vl_api_ip4_address_t remote_addr;
+  u16 remote_port;
+  u8 proto;
+  string timeout_class[16];
+  f64 idle;
+};
+
+define cgnat_get_status {
+  u32 client_index;
+  u32 context;
+};
+
+define cgnat_get_status_reply {
+  u32 context;
+  i32 retval;
+  u32 maps;
+  u64 sessions;
+  u64 mappings;
+  u64 subscribers;
+  bool endpoint_independent_filtering;
+  u32 sessions_per_subscriber;
+  u32 tcp_established_timeout;
+  u32 tcp_transitory_timeout;
+  u32 udp_timeout;
+  u32 icmp_timeout;
+};

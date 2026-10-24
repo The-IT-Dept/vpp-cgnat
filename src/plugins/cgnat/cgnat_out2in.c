@@ -223,7 +223,7 @@ cgnat_out2in_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
   u32 nexts[VLIB_FRAME_SIZE], *next = nexts;
   u16 owners[VLIB_FRAME_SIZE], *owner = owners;
   u32 *from = vlib_frame_vector_args (frame);
-  u32 n_left = frame->n_vectors, n_drop;
+  u32 n_left = frame->n_vectors, n_drop, n_ok = 0;
   f64 now = vlib_time_now (vm);
 
   vlib_get_buffers (vm, from, bufs, n_left);
@@ -244,11 +244,16 @@ cgnat_out2in_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 	  tr->mapping_index = m ? m - t->mappings : ~0;
 	  tr->session_index = s ? s - t->sessions_pool : ~0;
 	}
+      n_ok += m != 0; /* translated */
       b++;
       next++;
       owner++;
       n_left--;
     }
+  vlib_increment_simple_counter (
+    &cm->counters[is_hairpin ? CGNAT_COUNTER_HAIRPIN_PACKETS :
+			       CGNAT_COUNTER_OUT2IN_PACKETS],
+    thread_index, 0, n_ok);
   n_drop = cgnat_dispatch (vm, node, from, nexts, owners, frame->n_vectors,
 			   is_hairpin ? cm->fq_hairpin_index :
 					cm->fq_out2in_index);

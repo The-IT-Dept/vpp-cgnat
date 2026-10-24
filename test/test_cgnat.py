@@ -661,5 +661,113 @@ class TestCgnatHairpinWorkers(TestCgnatHairpin):
                 self.assertEqual((rx[IP].src, rx[UDP].sport), pub[i])
 
 
+class TestCgnatStartupConf(VppTestCase):
+    """CGNAT startup.conf section"""
+
+    extra_vpp_config = [
+        "cgnat",
+        "{",
+        "sessions-per-subscriber 7",
+        "timeouts { udp 11 tcp-established 3600 }",
+        "filtering endpoint-independent",
+        "}",
+    ]
+
+    def test_startup_conf_applied(self):
+        """startup.conf values show in cgnat_get_status"""
+        st = self.vapi.cgnat_get_status()
+        self.assertEqual(st.sessions_per_subscriber, 7)
+        self.assertEqual(st.udp_timeout, 11)
+        self.assertEqual(st.tcp_established_timeout, 3600)
+        self.assertEqual(st.tcp_transitory_timeout, 240)
+        self.assertEqual(st.icmp_timeout, 60)
+        self.assertTrue(st.endpoint_independent_filtering)
+
+
+class TestCgnatOps(CgnatPgCase):
+    """CGNAT operations: stats, session dump, status, map flush"""
+
+    def gauge(self, name):
+        return sum(sum(per) for per in self.statistics.get_counter("/cgnat/" + name))
+
+    def five_flows(self):
+        h, r = self.host(), self.pg1.remote_ip4
+        pkts = [self.in_pkt(h, 5000 + i, r, 53) for i in range(5)]
+        rx = self.send_and_expect(self.pg0, pkts, self.pg1)
+        rx = sorted(rx, key=lambda p: p[UDP].sport)
+        replies = [self.out_pkt(r, 53, p[IP].src, p[UDP].sport) for p in rx]
+        self.send_and_expect(self.pg1, replies, self.pg0)
+        return rx
+
+    def test_stats_counters(self):
+        """Packet counters and session/mapping/subscriber gauges in the stats segment"""
+        before = self.gauge("in2out-packets"), self.gauge("out2in-packets")
+        self.five_flows()
+        self.assertEqual(self.gauge("in2out-packets") - before[0], 5)
+        self.assertEqual(self.gauge("out2in-packets") - before[1], 5)
+        self.assertEqual(self.gauge("sessions"), 5)
+        self.assertEqual(self.gauge("mappings"), 5)
+        self.assertEqual(self.gauge("subscribers"), 1)
+
+    def test_session_dump(self):
+        """Session dump shows every session with its inside/outside/remote tuple"""
+        rx = self.five_flows()
+        h = self.host()
+        got = sorted(
+            (str(s.in_addr), s.in_port, str(s.out_addr), s.out_port,
+             str(s.remote_addr), s.remote_port, s.proto)
+            for s in self.vapi.cgnat_session_dump(in_vrf=self.in_vrf, in_addr=h)
+        )
+        out, lo, hi = self.block(h)
+        want = sorted(
+            (h, 5000 + i, out, lo + (5000 + i) % (hi - lo + 1), self.pg1.remote_ip4, 53, 17)
+            for i in range(5)
+        )
+        self.assertEqual(got, want)
+        self.assertEqual(len(self.vapi.cgnat_session_dump(all=1)), 5)
+        self.assertEqual(
+            len(self.vapi.cgnat_session_dump(in_vrf=self.in_vrf, in_addr=self.host(1))), 0
+        )
+        out = self.vapi.cli("show cgnat sessions subscriber %s inside-vrf %d" % (h, self.in_vrf))
+        self.assertEqual(out.count("thread"), 5)
+
+    def test_status(self):
+        """cgnat_get_status counts maps, sessions, mappings, subscribers"""
+        self.five_flows()
+        st = self.vapi.cgnat_get_status()
+        self.assertEqual((st.maps, st.sessions, st.mappings, st.subscribers), (1, 5, 5, 1))
+        self.assertIn("sessions 5", self.vapi.cli("show cgnat status"))
+
+    def test_map_delete_flushes_sessions(self):
+        """Deleting a map with live sessions flushes them; later packets drop (no-map)"""
+        self.five_flows()
+        clear_cgnat(self)
+        self.assertEqual(
+            (self.gauge("sessions"), self.gauge("mappings"), self.gauge("subscribers")),
+            (0, 0, 0),
+        )
+        before = self.err("cgnat-in2out", "no-map")
+        p = self.in_pkt(self.host(), 5000, self.pg1.remote_ip4, 53)
+        self.send_and_assert_no_replies(self.pg0, [p], remark="map gone")
+        self.assertEqual(self.err("cgnat-in2out", "no-map") - before, 1)
+
+    def test_map_readd_after_flush(self):
+        """Delete then re-add the same map: same inside port gets the same outside port"""
+        first = self.in2out(self.host(), 5000, self.pg1.remote_ip4, 53)
+        clear_cgnat(self)
+        self.vapi.cgnat_map_add_del(
+            is_add=1, in_vrf=self.in_vrf, in_addr=self.inside_net(), in_plen=24,
+            out_vrf=0, out_addr=self.pool, out_plen=self.pool_plen,
+        )
+        again = self.in2out(self.host(), 5000, self.pg1.remote_ip4, 53)
+        self.assertEqual((again[IP].src, again[UDP].sport), (first[IP].src, first[UDP].sport))
+
+
+class TestCgnatOpsWorkers(TestCgnatOps):
+    """CGNAT operations with 2 workers"""
+
+    vpp_worker_count = 2
+
+
 if __name__ == "__main__":
     unittest.main(testRunner=VppTestRunner)

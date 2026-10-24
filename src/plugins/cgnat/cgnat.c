@@ -60,6 +60,12 @@ cgnat_map_flush (u32 map_index)
   vec_free (to_free);
 }
 
+u64
+cgnat_counter_total (cgnat_counter_t c)
+{
+  return vlib_get_simple_counter (&cgnat_main.counters[c], 0);
+}
+
 static clib_error_t *
 cgnat_init (vlib_main_t *vm)
 {
@@ -92,6 +98,23 @@ cgnat_init (vlib_main_t *vm)
       }
   }
 
+  {
+    static char *names[] = {
+#define _(sym, name) name,
+      foreach_cgnat_counter
+#undef _
+    };
+    int i;
+    for (i = 0; i < CGNAT_N_COUNTER; i++)
+      {
+	cm->counters[i].name = names[i];
+	cm->counters[i].stat_segment_name =
+	  (char *) format (0, "/cgnat/%s%c", names[i], 0);
+	vlib_validate_simple_counter (&cm->counters[i], 0);
+	vlib_zero_simple_counter (&cm->counters[i], 0);
+      }
+  }
+
   vec_validate (cm->per_thread, tm->n_vlib_mains - 1);
   vec_foreach (t, cm->per_thread)
     cgnat_per_thread_init (t);
@@ -99,6 +122,55 @@ cgnat_init (vlib_main_t *vm)
 }
 
 VLIB_INIT_FUNCTION (cgnat_init);
+
+uword unformat_cgnat_timeouts (unformat_input_t *input, va_list *args);
+
+/*
+ * startup.conf:
+ *   cgnat {
+ *     sessions-per-subscriber <n>
+ *     timeouts { tcp-established <s> tcp-transitory <s> udp <s> icmp <s> }
+ *     filtering address-dependent | endpoint-independent
+ *   }
+ */
+static clib_error_t *
+cgnat_config (vlib_main_t *vm, unformat_input_t *input)
+{
+  cgnat_main_t *cm = &cgnat_main;
+  unformat_input_t sub;
+  u32 t[CGNAT_N_TO], n;
+  int i;
+
+  clib_memcpy (t, cm->timeouts, sizeof (t));
+  while (unformat_check_input (input) != UNFORMAT_END_OF_INPUT)
+    {
+      if (unformat (input, "sessions-per-subscriber %u", &n) && n)
+	cm->sessions_per_sub = n;
+      else if (unformat (input, "timeouts %U", unformat_vlib_cli_sub_input,
+			 &sub))
+	{
+	  if (!unformat (&sub, "%U", unformat_cgnat_timeouts, t) ||
+	      unformat_check_input (&sub) != UNFORMAT_END_OF_INPUT)
+	    return clib_error_return (0, "cgnat: bad timeouts '%U'",
+				      format_unformat_error, &sub);
+	  unformat_free (&sub);
+	}
+      else if (unformat (input, "filtering endpoint-independent"))
+	cm->endpoint_independent_filtering = 1;
+      else if (unformat (input, "filtering address-dependent"))
+	cm->endpoint_independent_filtering = 0;
+      else
+	return clib_error_return (0, "cgnat: unknown input '%U'",
+				  format_unformat_error, input);
+    }
+  for (i = 0; i < CGNAT_N_TO; i++)
+    if (!t[i])
+      return clib_error_return (0, "cgnat: timeouts must be > 0");
+  clib_memcpy (cm->timeouts, t, sizeof (t));
+  return 0;
+}
+
+VLIB_CONFIG_FUNCTION (cgnat_config, "cgnat");
 
 static clib_error_t *
 cgnat_main_loop_enter (vlib_main_t *vm)

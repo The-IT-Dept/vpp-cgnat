@@ -23,6 +23,7 @@ cgnat_sub_get (cgnat_per_thread_t *t, u32 thread_index, u32 in_fib_index,
   sub->in_fib_index = in_fib_index;
   kv.value = sub - t->subs_pool;
   clib_bihash_add_del_8_8 (&t->subs, &kv, 1);
+  cgnat_gauge (thread_index, CGNAT_COUNTER_SUBSCRIBERS, 1);
   return sub;
 }
 
@@ -37,6 +38,7 @@ cgnat_sub_put_if_idle (cgnat_per_thread_t *t, u32 thread_index,
   kv.key = (u64) sub->in_fib_index << 32 | sub->in_addr.as_u32;
   clib_bihash_add_del_8_8 (&t->subs, &kv, 0);
   pool_put (t->subs_pool, sub);
+  cgnat_gauge (thread_index, CGNAT_COUNTER_SUBSCRIBERS, -1);
 }
 
 u16
@@ -87,6 +89,7 @@ cgnat_mapping_create (cgnat_per_thread_t *t, u32 thread_index,
 		    proto);
   kv.value = m - t->mappings;
   clib_bihash_add_del_16_8 (&t->out2in, &kv, 1);
+  cgnat_gauge (thread_index, CGNAT_COUNTER_MAPPINGS, 1);
   return m;
 }
 
@@ -108,6 +111,7 @@ cgnat_mapping_free_if_idle (cgnat_per_thread_t *t, u32 thread_index,
   sub = pool_elt_at_index (t->subs_pool, m->sub_index);
   sub->n_mappings--;
   pool_put (t->mappings, m);
+  cgnat_gauge (thread_index, CGNAT_COUNTER_MAPPINGS, -1);
   cgnat_sub_put_if_idle (t, thread_index, sub);
 }
 
@@ -152,6 +156,7 @@ cgnat_session_create (cgnat_per_thread_t *t, u32 thread_index,
 
   m->n_sessions++;
   pool_elt_at_index (t->subs_pool, m->sub_index)->n_sessions++;
+  cgnat_gauge (thread_index, CGNAT_COUNTER_SESSIONS, 1);
   return s;
 }
 
@@ -169,6 +174,7 @@ cgnat_session_free (cgnat_per_thread_t *t, u32 thread_index,
   clib_dlist_remove (t->lru_pool, s->lru_index);
   pool_put_index (t->lru_pool, s->lru_index);
   pool_put (t->sessions_pool, s);
+  cgnat_gauge (thread_index, CGNAT_COUNTER_SESSIONS, -1);
 
   m->n_sessions--;
   pool_elt_at_index (t->subs_pool, m->sub_index)->n_sessions--;

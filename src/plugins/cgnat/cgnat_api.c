@@ -7,6 +7,7 @@
 #include <vnet/fib/fib_table.h>
 #include <vlibmemory/api.h>
 #include <cgnat/cgnat.h>
+#include <cgnat/cgnat_session.h>
 #include <cgnat/cgnat.api_enum.h>
 #include <cgnat/cgnat.api_types.h>
 
@@ -169,6 +170,93 @@ vl_api_cgnat_set_timeouts_t_handler (vl_api_cgnat_set_timeouts_t *mp)
   if (!rv)
     clib_memcpy (cm->timeouts, v, sizeof (v));
   REPLY_MACRO (VL_API_CGNAT_SET_TIMEOUTS_REPLY);
+}
+
+static u8 cgnat_ip_proto[] = { IP_PROTOCOL_UDP, IP_PROTOCOL_TCP,
+			       IP_PROTOCOL_ICMP };
+static char *cgnat_class_name[] = { "tcp-established", "tcp-transitory",
+				    "udp", "icmp" };
+
+static void
+vl_api_cgnat_session_dump_t_handler (vl_api_cgnat_session_dump_t *mp)
+{
+  cgnat_main_t *cm = &cgnat_main;
+  vl_api_cgnat_session_details_t *rmp;
+  vl_api_registration_t *reg;
+  f64 now = vlib_time_now (vlib_get_main ());
+  cgnat_per_thread_t *t;
+  ip4_address_t in;
+  u32 fib_index = ~0;
+
+  reg = vl_api_client_index_to_registration (mp->client_index);
+  if (!reg)
+    return;
+  ip4_address_decode (mp->in_addr, &in);
+  if (!mp->all)
+    {
+      fib_index = fib_table_find (FIB_PROTOCOL_IP4, ntohl (mp->in_vrf));
+      if (fib_index == ~0)
+	return;
+    }
+
+  vec_foreach (t, cm->per_thread)
+    {
+      cgnat_session_t *s;
+
+      if (!mp->all &&
+	  !cgnat_sub_get (t, t - cm->per_thread, fib_index, &in, 0))
+	continue;
+      pool_foreach (s, t->sessions_pool)
+	{
+	  cgnat_mapping_t *m = pool_elt_at_index (t->mappings, s->mapping_index);
+	  cgnat_map_t *map = pool_elt_at_index (cm->maps, m->map_index);
+
+	  if (!mp->all && (m->in_fib_index != fib_index ||
+			   m->in_addr.as_u32 != in.as_u32))
+	    continue;
+	  rmp = vl_msg_api_alloc_zero (sizeof (*rmp));
+	  rmp->_vl_msg_id =
+	    htons (VL_API_CGNAT_SESSION_DETAILS + cm->msg_id_base);
+	  rmp->context = mp->context;
+	  rmp->thread_index = htonl (t - cm->per_thread);
+	  rmp->in_vrf = htonl (map->in_table_id);
+	  ip4_address_encode (&m->in_addr, rmp->in_addr);
+	  rmp->in_port = m->in_port;
+	  ip4_address_encode (&m->out_addr, rmp->out_addr);
+	  rmp->out_port = m->out_port;
+	  ip4_address_encode (&s->remote_addr, rmp->remote_addr);
+	  rmp->remote_port = s->remote_port;
+	  rmp->proto = cgnat_ip_proto[m->proto];
+	  strncpy ((char *) rmp->timeout_class, cgnat_class_name[s->to_class],
+		   sizeof (rmp->timeout_class) - 1);
+	  rmp->idle = clib_host_to_net_f64 (now - s->last_heard);
+	  vl_api_send_msg (reg, (u8 *) rmp);
+	}
+    }
+}
+
+static void
+vl_api_cgnat_get_status_t_handler (vl_api_cgnat_get_status_t *mp)
+{
+  cgnat_main_t *cm = &cgnat_main;
+  vl_api_cgnat_get_status_reply_t *rmp;
+  int rv = 0;
+
+  REPLY_MACRO2 (VL_API_CGNAT_GET_STATUS_REPLY, ({
+    rmp->maps = htonl (pool_elts (cm->maps));
+    rmp->sessions =
+      clib_host_to_net_u64 (cgnat_counter_total (CGNAT_COUNTER_SESSIONS));
+    rmp->mappings =
+      clib_host_to_net_u64 (cgnat_counter_total (CGNAT_COUNTER_MAPPINGS));
+    rmp->subscribers =
+      clib_host_to_net_u64 (cgnat_counter_total (CGNAT_COUNTER_SUBSCRIBERS));
+    rmp->endpoint_independent_filtering = cm->endpoint_independent_filtering;
+    rmp->sessions_per_subscriber = htonl (cm->sessions_per_sub);
+    rmp->tcp_established_timeout = htonl (cm->timeouts[CGNAT_TO_TCP_EST]);
+    rmp->tcp_transitory_timeout = htonl (cm->timeouts[CGNAT_TO_TCP_TRANS]);
+    rmp->udp_timeout = htonl (cm->timeouts[CGNAT_TO_UDP]);
+    rmp->icmp_timeout = htonl (cm->timeouts[CGNAT_TO_ICMP]);
+  }));
 }
 
 #include <vnet/format_fns.h>
