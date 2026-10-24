@@ -311,6 +311,7 @@ cgnat_in2out_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
   f64 now = vlib_time_now (vm);
 
   vlib_get_buffers (vm, from, bufs, n_left);
+  cgnat_prefetch_frame (t, bufs, n_left, 0, is_steered);
   while (n_left)
     {
       cgnat_mapping_t *m = 0;

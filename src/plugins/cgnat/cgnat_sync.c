@@ -280,8 +280,8 @@ apply_record (vlib_main_t *vm, cgnat_per_thread_t *t, u32 ti,
   else if (!s->warm)
     return CGNAT_SYNC_WORKER_ERROR_OWNED; /* we own it: keep our state */
   s->tcp_state = r->tcp_state;
-  cgnat_session_touch (t, s, r->to_class,
-		       now - clib_net_to_host_u16 (r->idle_ds) / 10.0);
+  cgnat_session_relink (t, s, r->to_class,
+			now - clib_net_to_host_u16 (r->idle_ds) / 10.0, now);
   s->warm = 1;
   s->last_synced = now;
   return CGNAT_SYNC_WORKER_ERROR_RECORDS;

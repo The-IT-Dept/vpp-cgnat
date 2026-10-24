@@ -54,7 +54,16 @@ VLIB_NODE_FN (cgnat_expire_walk_node)
 				 pool_elt_at_index (t->lru_pool, oldest)->value);
 	  if (now - s->last_heard <
 	      timeout + (s->warm ? cm->cluster.refresh_interval : 0))
-	    break;
+	    {
+	      /* heard since it was placed (lazy touch): move it along */
+	      if (s->last_heard > s->lru_at)
+		{
+		  cgnat_session_relink (t, s, c, s->last_heard, now);
+		  n++;
+		  continue;
+		}
+	      break;
+	    }
 	  cgnat_session_free (t, thread_index, s);
 	  n++;
 	}

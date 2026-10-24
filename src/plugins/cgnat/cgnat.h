@@ -90,6 +90,7 @@ typedef struct
   u8 inbound; /* created by an inbound packet (counts against inbound cap) */
   u8 warm;    /* copy of a session the peer owns (installed by sync) */
   f64 last_synced;
+  f64 lru_at; /* when last placed at its LRU list tail */
   f64 last_heard;
   u32 lru_index;
 } cgnat_session_t;

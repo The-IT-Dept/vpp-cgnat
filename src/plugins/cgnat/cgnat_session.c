@@ -146,6 +146,7 @@ cgnat_session_create (cgnat_per_thread_t *t, u32 thread_index,
   s->to_class = to_class;
   s->last_heard = now;
   s->last_synced = now;
+  s->lru_at = now;
   s->inbound = inbound;
 
   pool_get (t->lru_pool, e);

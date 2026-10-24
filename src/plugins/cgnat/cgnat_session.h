@@ -61,15 +61,37 @@ cgnat_adf_allows (cgnat_per_thread_t *t, u32 mapping_index, u32 raddr)
   return clib_bihash_search_inline_8_8 (&t->adf, &kv) == 0;
 }
 
-/* move the session to the tail of its timeout class list */
+/* (re)place the session at the tail of its timeout class list */
+static_always_inline void
+cgnat_session_relink (cgnat_per_thread_t *t, cgnat_session_t *s, u8 to_class,
+		      f64 when, f64 now)
+{
+  s->last_heard = when;
+  clib_dlist_remove (t->lru_pool, s->lru_index);
+  s->to_class = to_class;
+  clib_dlist_addtail (t->lru_pool, t->lru_head[to_class], s->lru_index);
+  s->lru_at = now;
+}
+
+/*
+ * Data-path touch.  Relinking costs three random dlist writes, so a
+ * session moves to its list tail at most once a second (or on a class
+ * change); last_heard is always exact.  The expiry walk relinks entries it
+ * finds out of place, so expiry is at most ~1 s late and never early.
+ */
+#define CGNAT_LRU_LAZY 1.0
+
 static_always_inline void
 cgnat_session_touch (cgnat_per_thread_t *t, cgnat_session_t *s, u8 to_class,
 		     f64 now)
 {
-  s->last_heard = now;
-  clib_dlist_remove (t->lru_pool, s->lru_index);
-  s->to_class = to_class;
-  clib_dlist_addtail (t->lru_pool, t->lru_head[to_class], s->lru_index);
+  if (PREDICT_TRUE (to_class == s->to_class &&
+		    now - s->lru_at < CGNAT_LRU_LAZY))
+    {
+      s->last_heard = now;
+      return;
+    }
+  cgnat_session_relink (t, s, to_class, now, now);
 }
 
 cgnat_sub_t *cgnat_sub_get (cgnat_per_thread_t *t, u32 thread_index,

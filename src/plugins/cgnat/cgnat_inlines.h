@@ -15,6 +15,7 @@
 #include <vppinfra/xxhash.h>
 #include <cgnat/cgnat.h>
 #include <cgnat/cgnat_owner.h>
+#include <cgnat/cgnat_session.h>
 
 /* thread owning a subscriber on this node: all its state lives there */
 static_always_inline u32
@@ -289,6 +290,64 @@ cgnat_icmp_error_inner (ip4_header_t *ip, u8 *proto, u16 *sport, u16 *dport,
     return 0;
   *avail = n;
   return inner;
+}
+
+/*
+ * Two prefetch passes over a frame before processing it: first the
+ * mapping buckets, then (with mappings now cached) the session buckets.
+ * Each lookup is otherwise a cache miss into tables far larger than cache.
+ * Wrong guesses (other thread's subscribers, ICMP errors) only cost a
+ * wasted prefetch.
+ */
+static_always_inline void
+cgnat_prefetch_frame (cgnat_per_thread_t *t, vlib_buffer_t **bufs, u32 n,
+		      int outside, int fib_in_tx)
+{
+  clib_bihash_kv_16_8_t kv[VLIB_FRAME_SIZE];
+  u64 h[VLIB_FRAME_SIZE];
+  u8 proto[VLIB_FRAME_SIZE];
+  u32 i;
+
+  for (i = 0; i < n; i++)
+    {
+      vlib_buffer_t *b = bufs[i];
+      ip4_header_t *ip = vlib_buffer_get_current (b);
+      u32 fib = fib_in_tx ? vnet_buffer (b)->sw_if_index[VLIB_TX] :
+			    ip4_fib_table_get_index_for_sw_if_index (
+			      vnet_buffer (b)->sw_if_index[VLIB_RX]);
+      proto[i] = cgnat_proto_of (ip->protocol);
+      cgnat_mapping_kv (&kv[i], fib,
+			outside ? ip->dst_address.as_u32 :
+				  ip->src_address.as_u32,
+			outside ? vnet_buffer (b)->ip.reass.l4_dst_port :
+				  vnet_buffer (b)->ip.reass.l4_src_port,
+			proto[i]);
+      h[i] = clib_bihash_hash_16_8 (&kv[i]);
+      clib_bihash_prefetch_bucket_16_8 (outside ? &t->out2in : &t->in2out,
+					h[i]);
+    }
+  for (i = 0; i < n; i++)
+    {
+      vlib_buffer_t *b = bufs[i];
+      ip4_header_t *ip = vlib_buffer_get_current (b);
+      clib_bihash_kv_16_8_t skv;
+      u16 rport;
+
+      if (clib_bihash_search_inline_with_hash_16_8 (
+	    outside ? &t->out2in : &t->in2out, h[i], &kv[i]))
+	continue;
+      rport = proto[i] == CGNAT_PROTO_ICMP ?
+		0 :
+		(outside ? vnet_buffer (b)->ip.reass.l4_src_port :
+			   vnet_buffer (b)->ip.reass.l4_dst_port);
+      cgnat_session_kv (&skv, kv[i].value,
+			outside ? ip->src_address.as_u32 :
+				  ip->dst_address.as_u32,
+			rport);
+      clib_bihash_prefetch_bucket_16_8 (&t->sessions,
+					clib_bihash_hash_16_8 (&skv));
+      clib_prefetch_load (pool_elt_at_index (t->mappings, kv[i].value));
+    }
 }
 
 #endif /* included_cgnat_inlines_h */
