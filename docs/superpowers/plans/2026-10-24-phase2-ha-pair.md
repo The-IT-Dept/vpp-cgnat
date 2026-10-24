@@ -298,6 +298,35 @@ def test_peer_fast_restart_resets_streams(self): # peer ready; new epoch in HELL
 - [ ] **Step 3:** Run it with the Phase 2 build. Expected: PASS. Record the measured failover gap, failback gap, sync records/s and the pair-link bandwidth.
 - [ ] **Step 4: Commit** `"HA lab: two-VPP namespace harness, kill/restore test"` with the result log in `lab/ha/results-<date>.txt`.
 
+### Task 6a: Data-path speed (before the lab)
+
+**Files:** `cgnat_in2out.c`, `cgnat_out2in.c`, `cgnat_session.[ch]`, `bench/`
+- Prefetch the bihash bucket for packet i+N while processing packet i (`clib_bihash_hash_16_8`, `clib_bihash_prefetch_bucket_16_8`, `clib_bihash_search_inline_with_hash_16_8`).
+- One lookup per packet in each direction: add a 5-tuple session index (`clib_bihash_24_8`, keyed on the inside tuple and on the outside tuple), with the mapping lookup only on a miss.
+- Handoff: size the frame queues and batch per destination thread.
+- Pass criteria:
+  - `bench/run-all.sh` before and after: the 1-worker 15k-flow case at ≥ 2× today's 1.54 Mpps
+  - the 4-worker 1M case scales at ≥ 0.75 × per-worker rate × workers
+  - no handoff-queue-full drops below the forwarding rate
+  - all tests still pass
+
+### Task 8: Roll out and prove on cgnat-1 and cgnat-2 (prox-hv01, au-syd-0 production edge)
+
+- cgnat-2 is a new VM, a twin of cgnat-1. Both get:
+  - DPDK virtio-pci with multiqueue (queues = workers)
+  - vCPUs pinned on one NUMA node, hugepages, `cpu { main-core / corelist-workers }` matching the pins
+  - a pair link (a dedicated VLAN between them), with the probe paths on the inside and outside VLANs
+- core0 changes:
+  - the pool routes over both nodes' outside links, with ECMP
+  - the CGNAT VRF default over both inside links, with ECMP
+  - each node withdrawn when it isn't ready
+  - through `commit confirmed`, with a backup first
+- Prove it with the test line SVC-0004 on CGNAT plus blaster load:
+  - kill each node mid-download
+  - zero established-session loss, and the same public IP:port
+  - clean failback, and the cgnatd ledger unchanged
+- Record the numbers.
+
 ### Task 7: Docs and README
 
 **Files:**
