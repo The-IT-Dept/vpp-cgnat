@@ -11,6 +11,8 @@
  */
 
 #include <vnet/fib/fib_table.h>
+#include <vnet/adj/adj.h>
+#include <vnet/adj/adj_nbr.h>
 #include <vnet/udp/udp_local.h>
 #include <vnet/udp/udp_packet.h>
 #include <vnet/ip/ip4.h>
@@ -149,7 +151,9 @@ cgnat_cluster_send_hellos (vlib_main_t *vm)
 				(void **) &hb, &bi))
 	break;
       hb->path_id = i;
-      hb->state = (cl->ready ? CGNAT_HELLO_READY : 0) |
+      /* ready for routing isn't enough for the peer to hand us
+	 subscribers: our next hops must be up too */
+      hb->state = (cl->ready && cl->forwarding ? CGNAT_HELLO_READY : 0) |
 		  (cl->fenced ? CGNAT_HELLO_FENCED : 0) |
 		  (cl->want_resync_peer ? CGNAT_HELLO_WANT_RESYNC : 0) |
 		  (cgnat_cluster_peer_in_active (cl) ?
@@ -213,6 +217,38 @@ cgnat_data_links_up (void)
   return 1;
 }
 
+static adj_walk_rc_t
+cgnat_adj_down_cb (adj_index_t ai, void *arg)
+{
+  if (adj_is_up (ai))
+    return ADJ_WALK_RC_CONTINUE;
+  *(int *) arg = 1;
+  return ADJ_WALK_RC_STOP;
+}
+
+/* can VPP forward via every neighbour on the interfaces we translate on?
+   A neighbour with a BFD session that isn't up is down to the FIB, so
+   routes via it drop: routing glue that only enables BFD once we're
+   ready leaves a gap of a BFD slow-start round or two, and a lost
+   router stays down */
+static int
+cgnat_next_hops_up (void)
+{
+  cgnat_main_t *cm = &cgnat_main;
+  uword *ifs[] = { cm->inside_ifs, cm->outside_ifs };
+  u32 i, sw_if_index;
+  int down = 0;
+
+  for (i = 0; i < ARRAY_LEN (ifs) && !down; i++)
+    clib_bitmap_foreach (sw_if_index, ifs[i])
+      {
+	adj_nbr_walk (sw_if_index, FIB_PROTOCOL_IP4, cgnat_adj_down_cb, &down);
+	if (down)
+	  break;
+      }
+  return !down;
+}
+
 /* evaluate liveness and readiness; runs on main each hello interval */
 static void
 cgnat_cluster_evaluate (vlib_main_t *vm, f64 now)
@@ -243,6 +279,7 @@ cgnat_cluster_evaluate (vlib_main_t *vm, f64 now)
       cl->peer_alive |= p->alive;
     }
   cl->pair_alive = vec_len (cl->paths) && cl->paths[0].alive;
+  cl->forwarding = cgnat_next_hops_up ();
 
   /* starting lasts one dead interval from when our pair-link address
      exists on an interface that has link: until then we can't hear the
@@ -395,7 +432,10 @@ cgnat_cluster_evaluate (vlib_main_t *vm, f64 now)
 	n = 1, a = cl->peer_node_id;
       else
 	{
-	  if (cl->ready && !cl->handover_pending)
+	  /* while our next hops are down the peer serves everyone;
+	     alone, we serve what we can */
+	  if (cl->ready && !cl->handover_pending &&
+	      (cl->forwarding || !peer_in))
 	    a = cl->node_id, n++;
 	  if (peer_in)
 	    {

@@ -493,6 +493,9 @@ show_cgnat_cluster_fn (vlib_main_t *vm, unformat_input_t *input,
 		   (cl->peer_state & CGNAT_HELLO_READY) ? ", ready" : "",
 		   (cl->peer_state & CGNAT_HELLO_FENCED) ? ", fenced" : "",
 		   cl->peer_config_hash);
+  if (cl->ready && !cl->forwarding)
+    vlib_cli_output (vm, "next hops: down (BFD not up yet?), the peer "
+			 "keeps our subscribers");
   vec_foreach (p, cl->paths)
     vlib_cli_output (vm, "  path %u %U -> %U table %u: %s (%.2fs ago)",
 		     p - cl->paths, format_ip4_address, &p->local,

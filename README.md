@@ -5,11 +5,12 @@ A carrier-grade NAT plugin for [VPP](https://fd.io), built around
 commodity servers.
 
 > **Status:** the single node (Phase 1) and the active/active pair (Phase 2) are
-> done, tested in VPP's `make test` (165 tests) and in a two-VPP lab with real
+> done, tested in VPP's `make test` (171 tests) and in a two-VPP lab with real
 > TCP/UDP flows and kill/restore, and running in production in front of an ISP
-> core router. See
-> [the design](docs/superpowers/specs/2026-10-24-cgnat-ha-design.md) and
-> [configuration](docs/config.md).
+> core router on SR-IOV VFs: about 2.0 Mpps lossless and 2.9 Mpps peak on two
+> worker cores. See
+> [the design](docs/superpowers/specs/2026-10-24-cgnat-ha-design.md),
+> [configuration](docs/config.md) and [SR-IOV](docs/sriov.md).
 
 ## Why
 
@@ -84,6 +85,7 @@ Two nodes, both translating.
 - **Failback:** a returning node pulls the whole table, then takes its subscribers back in two phases.
 - **Split brain:** liveness runs on several paths. If only the pair link fails, the higher id fences.
 - **Readiness:** the plugin exposes "ready" for the operator's routing to watch. `contrib/cgnat-ready-bfd.sh` keeps BFD up only while ready. The plugin itself does no routing.
+- **Interface and next-hop monitoring:** a node is not ready while any translating interface is down or has no link. It takes subscribers from its peer only once VPP can forward via every neighbour on those interfaces, so a BFD session that isn't up yet, or a lost router, keeps them on the peer.
 
 **Two-VPP lab** ([lab/ha](lab/ha/README.md)): a router namespace load-shares
 both directions across both nodes. 12 TCP streams and 16 UDP flows run while
@@ -94,14 +96,13 @@ node B is killed with `kill -9` at 15 s and restarted at 35 s:
 | without the pair (two independent nodes) | FAIL: UDP flows lose everything, TCP connections fail |
 | with the pair | PASS (repeatable): 14/14 TCP connections kept with the same public IP:port, no throughput dip at kill or restore, UDP worst gap per flow 0.6 s (failure detection + route change) |
 
-**Production proof** (2026-10-24). Two VMs (DPDK virtio, 2 workers each) in
-front of a Juniper MX204: static routes with BFD-checked next hops, ECMP, and
-`contrib/cgnat-ready-bfd.sh` on each node. The test ran on a real subscriber
+**Production proof.** Two VMs (2 workers each) in front of a Juniper MX204:
+static routes with BFD-checked next hops, ECMP, and
+`contrib/cgnat-ready-bfd.sh` on each node. The tests ran on a real subscriber
 line (IPoE via the MX's BNG, CGNAT VRF):
 
-- A 792 MB HTTP download completed byte-perfect over one TCP connection while node 1 was killed with `kill -9` mid-transfer, restarted and rejoined, and then node 2 was killed.
-- The connection kept the same public IP:port throughout.
-- A 1-second ping through the same line lost 4 of 150 packets across the four events.
+- **On virtio (2026-10-24):** a 792 MB HTTP download completed byte-perfect over one TCP connection while node 1 was killed with `kill -9` mid-transfer, restarted and rejoined, and then node 2 was killed. The connection kept the same public IP:port throughout. A 1-second ping through the same line lost 4 of 150 packets across the four events.
+- **On SR-IOV VFs (2026-10-25):** an 800,000,000-byte download completed byte-perfect through kill, rejoin and kill, with the same public IP:port. A 0.2 s ping lost 0.6 s when the subscriber's owner was killed and 0.4 s when the other node was. Rejoins on VFs exposed three start-up timing gaps that virtio hid; they and their fixes are in [docs/sriov.md](docs/sriov.md#failover-lessons-from-vfs).
 
 **Dual sessions, shown on the live pair:** two subscribers whose owners are
 different nodes, each node's table dumped over the API:
@@ -113,34 +114,20 @@ different nodes, each node's table dumped over the API:
 
 Both nodes held the identical 7 sessions with the same public IP:port.
 
-**DPDK in the VMs (production node, Proxmox virtio).** The test used a node
-with 2 workers on pinned host cores, DPDK `vfio-pci` on 2-queue virtio NICs,
-and VLANs through the host's OVS bridge. A DPDK generator VM sent 64-byte UDP
-from 4096 subscribers × 63 flows through a test map:
+**Throughput in the VMs, measured on the production nodes.** A DPDK generator
+VM sent 64-byte UDP from 4096 subscribers × 63 flows through a test map, to a
+node with 2 workers on pinned host cores:
 
-| offered | through the CGNAT | note |
-|---|---|---|
-| 130 kpps | 100% | |
-| 280 kpps | 100% | lossless ceiling |
-| 500 kpps | 85% (426 kpps) | |
-| 700–850 kpps | about 20% | every packet received and translated, then dropped at virtio TX |
-
-- **Where it stops:** the bottleneck is the host's vhost-net/OVS kernel path, not VPP. Every drop was a DPDK virtio TX failure on the output NIC, with no `rx-miss` on input.
-- **VPP's headroom:** the CGNAT workers ran at about 1,100–1,500 clocks per packet with vectors far from full. The translation itself has several times that headroom on these two workers.
-- **What 280 kpps lossless means:** roughly 2 Gb/s of typical traffic at an average of about 900 bytes per packet.
-
-**DPDK against the kernel path, measured on both production nodes.** Same
-generator and test. The test NICs were either bound to DPDK, or left to the
-guest kernel (virtio-net) and attached to VPP with `af_packet`:
-
-| node, I/O | lossless up to | best forwarded | at about 1 Mpps offered |
+| node, I/O | lossless up to | best forwarded | limited by |
 |---|---|---|---|
-| cgnat-2, DPDK virtio | 280 kpps | 426 kpps | n/a |
-| cgnat-1, DPDK virtio | 255 kpps | 477 kpps | 411 kpps |
-| cgnat-1, af_packet (kernel virtio-net) | 130 kpps | 172 kpps | 99 kpps (collapses) |
+| cgnat-1, **SR-IOV VFs** (DPDK) | **~2.0 Mpps** | **~2.9 Mpps** (at 4 Mpps offered) | CGNAT worker CPU |
+| cgnat-2, DPDK on virtio | 280 kpps | 426 kpps | host vhost-net/OVS |
+| cgnat-1, DPDK on virtio | 255 kpps | 477 kpps | host vhost-net/OVS |
+| cgnat-1, `af_packet` (kernel virtio-net) | 130 kpps | 172 kpps | guest kernel (collapses to 99 kpps at 1 Mpps) |
 
-- **DPDK is the right choice in the VM:** about 2–3× the kernel path, and it degrades gracefully instead of collapsing.
-- **The next step up is the host side:** SR-IOV VFs, or OVS-DPDK with vhost-user. Not tested: that's a host NIC/OVS change on a hypervisor that carries everything else.
+- **SR-IOV is about 7× virtio and 15× the kernel path** on the same two cores. On virtio the CGNAT had headroom (1,100–1,500 clocks per packet, vectors far from full) and the host's software switching was the ceiling. On VFs the workers are the limit: full vectors at about 670–1,000 clocks per packet, no NIC receive drops, and overload shed at the worker handoff without collapsing.
+- **2.0 Mpps lossless is about 14 Gb/s** at a typical ~900-byte average packet, more than the 10G port carries.
+- **Running on VFs** needs a small VPP patch (VLAN strip for host-enforced VLANs) and has failover timing lessons: see [docs/sriov.md](docs/sriov.md).
 
 ## Performance (single node, packet generator)
 
@@ -155,8 +142,8 @@ each worker's core, and at about 1.5 Mpps per worker it is the bottleneck.
 | established flows, 1M flows | 1.45 Mpps; cgnat node 1350 clocks/pkt |
 | memory | about 215 bytes per session |
 
-Proper numbers on dedicated cores with DPDK NICs and a real traffic generator
-are still to do. Raw results are in `bench/`.
+For dedicated cores and real NICs, see the SR-IOV numbers above. Raw results
+are in `bench/`.
 
 ## Building and testing
 
@@ -171,22 +158,19 @@ cd ~/vpp && make build                      # or make build-release
 ~/vpp-cgnat/scripts/test.sh test_cgnat      # VPP make test with this repo's tests
 ```
 
-The test suite is `test/test_cgnat.py`: 79 tests in VPP's own framework,
-covering every class above with 0 and 2 workers. `scripts/remote.sh` syncs to
+The test suites run in VPP's own framework: `test/test_cgnat.py` (79 tests,
+the single node with 0 and 2 workers) and `test/test_cgnat_cluster.py` (92
+tests, the pair against a scapy-emulated peer). VPP needs
+`patches/vpp-26.06-dpdk-vlan-strip.patch` only for SR-IOV VFs with
+host-enforced VLANs. `scripts/remote.sh` syncs to
 a build VM, rebuilds and runs a test from a workstation.
 
 ## Roadmap
 
-1. **Phase 1 — single node** (this release).
-2. **Phase 2 — the pair:**
-   - liveness on several paths, with split-brain fencing
-   - subscriber ownership across nodes and steering over a pair link
-   - reliable batched session sync with full resync
-   - failover and failback with zero established-session loss
-   - a "ready" state the operator's routing can watch
-3. **Lab proof:** two VMs announcing the pool by BGP with ECMP from the core,
-   real subscriber traffic, killing a node mid-download, and sizing measured
-   to the point of degradation.
+1. **Phase 1 — single node:** done.
+2. **Phase 2 — the pair:** done. Multi-path liveness with split-brain fencing, ownership and steering, reliable sync with full resync, failover and failback without losing established sessions, readiness for routing, and interface and next-hop monitoring.
+3. **Production proof:** done on virtio and on SR-IOV VFs, with static routes and BFD on a Juniper MX204 (see above). BGP announcement of the pool, as an alternative to static routes, is not built.
+4. **Next:** out-of-tree packaging, and a management agent driving maps over the binary API.
 
 ## Licence
 

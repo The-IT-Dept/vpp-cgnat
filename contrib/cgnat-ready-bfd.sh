@@ -12,22 +12,47 @@
 # Readiness comes from the stats segment (/cgnat/cluster/ready), which
 # doesn't stop the workers the way a CLI command does.  The gauge is set
 # while the cluster is enabled; a node without a cluster reads not-ready.
+#
+# Run it independently of VPP (not bound to vpp.service): it notices VPP
+# restarting (a new pid, whose startup config recreates the sessions
+# admin-down) and applies the state again, and it retries until every
+# set-flags succeeds.
 SOCK=${VPPCTL_SOCK:-/run/vpp/cli.sock}
 VPPCTL=${VPPCTL:-vppctl}
 STATS=${VPP_GET_STATS:-vpp_get_stats}
+# local state of the session "interface I local-addr A peer-addr B"
+session_state() {
+  set -- $1
+  $VPPCTL -s $SOCK show bfd sessions 2>/dev/null | tr -d "\r" |
+    awk -v l="$4" -v p="$6" '/IPv4 address/ {m = ($(NF-1) == l && $NF == p)}
+	m && /Session state/ {print $(NF-1); exit}'
+}
+
 state=""
+pid=""
 while true; do
   want=down
   if out=$(timeout 0.5 $STATS dump /cgnat/cluster/ready 2>/dev/null) &&
      echo "$out" | grep -q "^1"; then
     want=up
   fi
-  if [ "$want" != "$state" ]; then
+  now=$(pidof vpp)
+  [ "$now" != "$pid" ] && state=""  # a new VPP: its sessions start admin-down
+  pid=$now
+  if [ "$want" != "$state" ] && [ -n "$pid" ]; then
+    ok=1
     for s in "$@"; do
-      $VPPCTL -s $SOCK bfd udp session set-flags $s admin $want >/dev/null 2>&1
+      # admin up resets a session that is already up (the router sees a
+      # flap): only bring up sessions that are admin-down
+      [ $want = up ] && [ "$(session_state "$s")" != AdminDown ] &&
+	[ -n "$(session_state "$s")" ] && continue
+      out=$($VPPCTL -s $SOCK bfd udp session set-flags $s admin $want 2>&1)
+      [ $? -ne 0 ] || [ -n "$out" ] && ok=0
     done
-    logger -t cgnat-ready-bfd "cgnat ready=$( [ $want = up ] && echo yes || echo no ): bfd admin $want"
-    state=$want
+    if [ $ok = 1 ]; then
+      logger -t cgnat-ready-bfd "cgnat ready=$( [ $want = up ] && echo yes || echo no ): bfd admin $want"
+      state=$want
+    fi
   fi
   sleep 0.1
 done

@@ -229,6 +229,17 @@ while ready.
 | `config-mismatch` | as before | Maps or policy differ from the peer. The serving node stays ready and raises this alarm. Ownership is frozen and a node that isn't serving can't join until the configs agree. |
 | `duplicate-node-id` | no | The peer uses our node id. |
 
+**Ready is not yet serving.** A ready node takes subscribers from its peer only
+once VPP can forward via every neighbour on its translating interfaces. A
+single-hop BFD session makes VPP's FIB treat its neighbour as down until the
+session is up, so with `contrib/cgnat-ready-bfd.sh` there is a gap of a BFD
+slow-start round or two between "ready" (BFD enabled) and "forwarding". Until
+then the node is ready for routing, but it doesn't tell its peer it is ready,
+so the peer keeps its subscribers instead of steering them into routes that
+drop. The same holds in service: if a node's BFD to the router goes down, its
+peer takes everyone. A node with no live peer serves what it can.
+`show cgnat cluster` prints `next hops: down` while this is the case.
+
 A node that is already serving stays the incumbent: a joining or restarting peer
 resyncs from it. If the same peer incarnation comes back after a gap, the higher
 id resyncs from the lower.

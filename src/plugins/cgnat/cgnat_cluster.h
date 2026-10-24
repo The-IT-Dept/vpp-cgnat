@@ -72,6 +72,7 @@ typedef struct
   u8 ready;
   u8 fenced;
   u8 serving; /* data path may translate (owner checks come on top) */
+  u8 forwarding; /* every next hop on our translating interfaces is up */
   u32 active_word; /* active node set, see cgnat_owner.h */
 
   /* two-phase join: resynced, waiting for the peer to include us */

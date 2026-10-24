@@ -451,6 +451,34 @@ class TestCgnatClusterOwner(CgnatOwnerCase):
         self.assertTrue(self.capture_msgs(self.pg2, RESYNC_REQ))
         self.assertEqual(self.owners(), {2: 256})
 
+    def test_bfd_down_next_hop_holds_subscribers_back(self):
+        """A BFD session to our outside next hop that isn't up (just enabled by
+        routing glue, or the router gone) means VPP won't forward via it: we stay
+        ready for routing but don't tell the peer READY, so it keeps (or takes)
+        our subscribers instead of steering them into a blackhole"""
+        self.keep_hello(0.5)
+        self.assertEqual(set(self.owners()), {1, 2})
+        self.vapi.bfd_udp_add(sw_if_index=self.pg1.sw_if_index, desired_min_tx=100000,
+                              required_min_rx=100000, detect_mult=3,
+                              local_addr=self.pg1.local_ip4, peer_addr=self.pg1.remote_ip4)
+        try:
+            self.pg2.enable_capture()
+            self.keep_hello(0.4)
+            hellos = self.capture_msgs(self.pg2, HELLO)
+            self.assertTrue(hellos)
+            self.assertFalse(HELLO_BODY.unpack_from(hellos[-1][2])[1] & READY)
+            self.assertTrue(self.status().ready)  # routing may still bring us in
+            self.assertEqual(self.owners(), {2: 256})
+        finally:
+            self.vapi.bfd_udp_del(sw_if_index=self.pg1.sw_if_index,
+                                  local_addr=self.pg1.local_ip4,
+                                  peer_addr=self.pg1.remote_ip4)
+        self.pg2.enable_capture()
+        self.keep_hello(0.4)
+        hellos = self.capture_msgs(self.pg2, HELLO)
+        self.assertTrue(HELLO_BODY.unpack_from(hellos[-1][2])[1] & READY)
+        self.assertEqual(set(self.owners()), {1, 2})
+
     def test_mismatch_freezes_ownership(self):
         """Config mismatch: not ready, ownership stays as last agreed"""
         self.keep_hello(0.5)
