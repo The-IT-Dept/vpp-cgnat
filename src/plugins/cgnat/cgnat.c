@@ -79,6 +79,19 @@ cgnat_init (vlib_main_t *vm)
   cm->sessions_per_sub = 1000;
   cm->endpoint_independent_filtering = 0;
 
+  cm->first_worker_index = 0;
+  cm->n_workers = 0;
+  {
+    vlib_thread_registration_t *tr;
+    uword *p = hash_get_mem (tm->thread_registrations_by_name, "workers");
+    if (p)
+      {
+	tr = (vlib_thread_registration_t *) p[0];
+	cm->n_workers = tr->count;
+	cm->first_worker_index = tr->first_index;
+      }
+  }
+
   vec_validate (cm->per_thread, tm->n_vlib_mains - 1);
   vec_foreach (t, cm->per_thread)
     cgnat_per_thread_init (t);
@@ -86,6 +99,21 @@ cgnat_init (vlib_main_t *vm)
 }
 
 VLIB_INIT_FUNCTION (cgnat_init);
+
+static clib_error_t *
+cgnat_main_loop_enter (vlib_main_t *vm)
+{
+  cgnat_main_t *cm = &cgnat_main;
+
+  /* handoff queues to each node on the subscriber's owner thread */
+  cm->fq_in2out_index = vlib_frame_queue_main_init (cgnat_in2out_node.index, 0);
+  cm->fq_out2in_index = vlib_frame_queue_main_init (cgnat_out2in_node.index, 0);
+  cm->fq_hairpin_index =
+    vlib_frame_queue_main_init (cgnat_hairpin_node.index, 0);
+  return 0;
+}
+
+VLIB_MAIN_LOOP_ENTER_FUNCTION (cgnat_main_loop_enter);
 
 VLIB_PLUGIN_REGISTER () = {
   .version = VPP_BUILD_VER,

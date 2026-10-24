@@ -12,7 +12,59 @@
 #include <vnet/dpo/load_balance.h>
 #include <vnet/dpo/receive_dpo.h>
 #include <vnet/fib/ip4_fib.h>
+#include <vppinfra/xxhash.h>
 #include <cgnat/cgnat.h>
+
+/* thread owning a subscriber: all its state lives there */
+static_always_inline u32
+cgnat_owner_thread (u32 in_fib_index, u32 in_addr)
+{
+  cgnat_main_t *cm = &cgnat_main;
+  u64 h;
+
+  if (PREDICT_TRUE (cm->n_workers <= 1))
+    return cm->n_workers ? cm->first_worker_index : 0;
+  h = clib_xxhash ((u64) in_fib_index << 32 | in_addr);
+  return cm->first_worker_index + h % cm->n_workers;
+}
+
+/* next index meaning "hand off to the owner thread" */
+#define CGNAT_NEXT_HANDOFF ((u32) ~0)
+
+/*
+ * Enqueue a frame whose buffers were each marked either with a real next
+ * (local) or CGNAT_NEXT_HANDOFF with an owner thread.  Returns the number
+ * of buffers dropped on handoff congestion.
+ */
+static_always_inline u32
+cgnat_dispatch (vlib_main_t *vm, vlib_node_runtime_t *node, u32 *from,
+		u32 *nexts, u16 *owners, u32 n, u32 fq_index)
+{
+  u32 local_bi[VLIB_FRAME_SIZE], ho_bi[VLIB_FRAME_SIZE];
+  u16 local_next[VLIB_FRAME_SIZE], ho_ti[VLIB_FRAME_SIZE];
+  u32 n_local = 0, n_ho = 0, i, n_enq;
+
+  for (i = 0; i < n; i++)
+    {
+      if (PREDICT_FALSE (nexts[i] == CGNAT_NEXT_HANDOFF))
+	{
+	  ho_bi[n_ho] = from[i];
+	  ho_ti[n_ho++] = owners[i];
+	}
+      else
+	{
+	  local_bi[n_local] = from[i];
+	  local_next[n_local++] = nexts[i];
+	}
+    }
+  if (n_local)
+    vlib_buffer_enqueue_to_next (vm, node, local_bi, local_next, n_local);
+  if (!n_ho)
+    return 0;
+  n_enq = vlib_buffer_enqueue_to_thread (vm, node, fq_index, ho_bi, ho_ti,
+					 n_ho, 1 /* drop on congestion */);
+  return n_ho - n_enq;
+}
 
 static_always_inline u8
 cgnat_proto_of (u8 ip_proto)

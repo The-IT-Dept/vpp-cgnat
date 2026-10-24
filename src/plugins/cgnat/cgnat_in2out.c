@@ -17,7 +17,8 @@
   _ (CAP, "cap", "subscriber session limit reached")                          \
   _ (EXHAUSTED, "exhausted", "subscriber port block exhausted")               \
   _ (UNSUPPORTED, "unsupported", "protocol not translated")                   \
-  _ (TRUNCATED, "truncated", "L4 header truncated")
+  _ (TRUNCATED, "truncated", "L4 header truncated")                           \
+  _ (CONGESTION, "congestion", "handoff queue full")
 
 typedef enum
 {
@@ -46,6 +47,7 @@ typedef struct
 {
   u32 sw_if_index;
   u32 next_index;
+  u32 owner;
   u32 mapping_index;
   u32 session_index;
 } cgnat_in2out_trace_t;
@@ -57,6 +59,9 @@ format_cgnat_in2out_trace (u8 *s, va_list *args)
   CLIB_UNUSED (vlib_node_t * node) = va_arg (*args, vlib_node_t *);
   cgnat_in2out_trace_t *t = va_arg (*args, cgnat_in2out_trace_t *);
 
+  if (t->next_index == CGNAT_NEXT_HANDOFF)
+    return format (s, "CGNAT in2out: sw_if_index %u handoff to thread %u",
+		   t->sw_if_index, t->owner);
   return format (s, "CGNAT in2out: sw_if_index %u next %u mapping %d session %d",
 		 t->sw_if_index, t->next_index, t->mapping_index,
 		 t->session_index);
@@ -104,7 +109,7 @@ cgnat_in2out_icmp_error (vlib_main_t *vm, vlib_node_runtime_t *node,
 static_always_inline u32
 cgnat_in2out_one (vlib_main_t *vm, vlib_node_runtime_t *node, cgnat_per_thread_t *t,
 		  u32 thread_index, vlib_buffer_t *b, f64 now,
-		  cgnat_mapping_t **mp, cgnat_session_t **sp)
+		  cgnat_mapping_t **mp, cgnat_session_t **sp, u16 *owner)
 {
   cgnat_main_t *cm = &cgnat_main;
   ip4_header_t *ip = vlib_buffer_get_current (b);
@@ -119,6 +124,11 @@ cgnat_in2out_one (vlib_main_t *vm, vlib_node_runtime_t *node, cgnat_per_thread_t
 
   rx_fib = ip4_fib_table_get_index_for_sw_if_index (
     vnet_buffer (b)->sw_if_index[VLIB_RX]);
+
+  *owner = cgnat_owner_thread (rx_fib, ip->src_address.as_u32);
+  if (PREDICT_FALSE (*owner != thread_index))
+    return CGNAT_NEXT_HANDOFF;
+
   proto = cgnat_proto_of (ip->protocol);
   map = cgnat_map_by_inside (rx_fib, &ip->src_address);
 
@@ -225,9 +235,10 @@ VLIB_NODE_FN (cgnat_in2out_node)
   u32 thread_index = vm->thread_index;
   cgnat_per_thread_t *t = vec_elt_at_index (cm->per_thread, thread_index);
   vlib_buffer_t *bufs[VLIB_FRAME_SIZE], **b = bufs;
-  u16 nexts[VLIB_FRAME_SIZE], *next = nexts;
+  u32 nexts[VLIB_FRAME_SIZE], *next = nexts;
+  u16 owners[VLIB_FRAME_SIZE], *owner = owners;
   u32 *from = vlib_frame_vector_args (frame);
-  u32 n_left = frame->n_vectors;
+  u32 n_left = frame->n_vectors, n_drop;
   f64 now = vlib_time_now (vm);
 
   vlib_get_buffers (vm, from, bufs, n_left);
@@ -236,21 +247,28 @@ VLIB_NODE_FN (cgnat_in2out_node)
       cgnat_mapping_t *m = 0;
       cgnat_session_t *s = 0;
 
-      next[0] = cgnat_in2out_one (vm, node, t, thread_index, b[0], now, &m, &s);
+      next[0] = cgnat_in2out_one (vm, node, t, thread_index, b[0], now, &m,
+				  &s, owner);
       if (PREDICT_FALSE (b[0]->flags & VLIB_BUFFER_IS_TRACED))
 	{
 	  cgnat_in2out_trace_t *tr =
 	    vlib_add_trace (vm, node, b[0], sizeof (*tr));
 	  tr->sw_if_index = vnet_buffer (b[0])->sw_if_index[VLIB_RX];
 	  tr->next_index = next[0];
+	  tr->owner = owner[0];
 	  tr->mapping_index = m ? m - t->mappings : ~0;
 	  tr->session_index = s ? s - t->sessions_pool : ~0;
 	}
       b++;
       next++;
+      owner++;
       n_left--;
     }
-  vlib_buffer_enqueue_to_next (vm, node, from, nexts, frame->n_vectors);
+  n_drop = cgnat_dispatch (vm, node, from, nexts, owners, frame->n_vectors,
+			   cm->fq_in2out_index);
+  if (n_drop)
+    vlib_node_increment_counter (vm, node->node_index,
+				 CGNAT_IN2OUT_ERROR_CONGESTION, n_drop);
   return frame->n_vectors;
 }
 

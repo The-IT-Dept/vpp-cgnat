@@ -16,7 +16,8 @@
   _ (FILTERED, "filtered", "remote not allowed by filtering")                 \
   _ (CAP, "cap", "subscriber session limit reached")                          \
   _ (UNSUPPORTED, "unsupported", "protocol not translated")                   \
-  _ (TRUNCATED, "truncated", "L4 header truncated")
+  _ (TRUNCATED, "truncated", "L4 header truncated")                           \
+  _ (CONGESTION, "congestion", "handoff queue full")
 
 typedef enum
 {
@@ -43,6 +44,7 @@ typedef struct
 {
   u32 sw_if_index;
   u32 next_index;
+  u32 owner;
   u32 mapping_index;
   u32 session_index;
 } cgnat_out2in_trace_t;
@@ -54,6 +56,9 @@ format_cgnat_out2in_trace (u8 *s, va_list *args)
   CLIB_UNUSED (vlib_node_t * node) = va_arg (*args, vlib_node_t *);
   cgnat_out2in_trace_t *t = va_arg (*args, cgnat_out2in_trace_t *);
 
+  if (t->next_index == CGNAT_NEXT_HANDOFF)
+    return format (s, "CGNAT out2in: sw_if_index %u handoff to thread %u",
+		   t->sw_if_index, t->owner);
   return format (s, "CGNAT out2in: sw_if_index %u next %u mapping %d session %d",
 		 t->sw_if_index, t->next_index, t->mapping_index,
 		 t->session_index);
@@ -102,7 +107,7 @@ static_always_inline u32
 cgnat_out2in_one (vlib_main_t *vm, vlib_node_runtime_t *node,
 		  cgnat_per_thread_t *t, u32 thread_index, vlib_buffer_t *b,
 		  f64 now, cgnat_mapping_t **mp, cgnat_session_t **sp,
-		  int is_hairpin)
+		  u16 *owner, int is_hairpin)
 {
   cgnat_main_t *cm = &cgnat_main;
   ip4_header_t *ip = vlib_buffer_get_current (b);
@@ -112,6 +117,7 @@ cgnat_out2in_one (vlib_main_t *vm, vlib_node_runtime_t *node,
   cgnat_mapping_t *m;
   cgnat_session_t *s;
   cgnat_sub_t *sub;
+  cgnat_map_t *map;
   u8 proto;
 
   /* hairpinned packets were translated by in2out into the outside fib */
@@ -120,11 +126,33 @@ cgnat_out2in_one (vlib_main_t *vm, vlib_node_runtime_t *node,
 			  vnet_buffer (b)->sw_if_index[VLIB_RX]);
 
   /* not addressed to a pool: not ours */
-  if (!is_hairpin && !cgnat_map_by_outside (rx_fib, &ip->dst_address))
+  map = cgnat_map_by_outside (rx_fib, &ip->dst_address);
+  if (!map)
     {
+      if (is_hairpin)
+	{
+	  b->error = node->errors[CGNAT_OUT2IN_ERROR_NO_MAPPING];
+	  return CGNAT_OUT2IN_NEXT_DROP;
+	}
       vnet_feature_next (&next, b);
       return next;
     }
+
+  /* the subscriber, by the reverse formula, picks the owner thread */
+  {
+    ip4_address_t in;
+    if (cgnat_reverse (map, &ip->dst_address,
+		       clib_net_to_host_u16 (
+			 vnet_buffer (b)->ip.reass.l4_dst_port),
+		       &in))
+      {
+	b->error = node->errors[CGNAT_OUT2IN_ERROR_NO_MAPPING];
+	return CGNAT_OUT2IN_NEXT_DROP;
+      }
+    *owner = cgnat_owner_thread (map->in_fib_index, in.as_u32);
+    if (PREDICT_FALSE (*owner != thread_index))
+      return CGNAT_NEXT_HANDOFF;
+  }
 
   proto = cgnat_proto_of (ip->protocol);
   if (proto == CGNAT_PROTO_ICMP)
@@ -192,9 +220,10 @@ cgnat_out2in_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
   u32 thread_index = vm->thread_index;
   cgnat_per_thread_t *t = vec_elt_at_index (cm->per_thread, thread_index);
   vlib_buffer_t *bufs[VLIB_FRAME_SIZE], **b = bufs;
-  u16 nexts[VLIB_FRAME_SIZE], *next = nexts;
+  u32 nexts[VLIB_FRAME_SIZE], *next = nexts;
+  u16 owners[VLIB_FRAME_SIZE], *owner = owners;
   u32 *from = vlib_frame_vector_args (frame);
-  u32 n_left = frame->n_vectors;
+  u32 n_left = frame->n_vectors, n_drop;
   f64 now = vlib_time_now (vm);
 
   vlib_get_buffers (vm, from, bufs, n_left);
@@ -203,22 +232,29 @@ cgnat_out2in_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
       cgnat_mapping_t *m = 0;
       cgnat_session_t *s = 0;
 
-      next[0] = cgnat_out2in_one (vm, node, t, thread_index, b[0], now, &m, &s,
-				  is_hairpin);
+      next[0] = cgnat_out2in_one (vm, node, t, thread_index, b[0], now, &m,
+				  &s, owner, is_hairpin);
       if (PREDICT_FALSE (b[0]->flags & VLIB_BUFFER_IS_TRACED))
 	{
 	  cgnat_out2in_trace_t *tr =
 	    vlib_add_trace (vm, node, b[0], sizeof (*tr));
 	  tr->sw_if_index = vnet_buffer (b[0])->sw_if_index[VLIB_RX];
 	  tr->next_index = next[0];
+	  tr->owner = owner[0];
 	  tr->mapping_index = m ? m - t->mappings : ~0;
 	  tr->session_index = s ? s - t->sessions_pool : ~0;
 	}
       b++;
       next++;
+      owner++;
       n_left--;
     }
-  vlib_buffer_enqueue_to_next (vm, node, from, nexts, frame->n_vectors);
+  n_drop = cgnat_dispatch (vm, node, from, nexts, owners, frame->n_vectors,
+			   is_hairpin ? cm->fq_hairpin_index :
+					cm->fq_out2in_index);
+  if (n_drop)
+    vlib_node_increment_counter (vm, node->node_index,
+				 CGNAT_OUT2IN_ERROR_CONGESTION, n_drop);
   return frame->n_vectors;
 }
 

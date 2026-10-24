@@ -98,8 +98,13 @@ typedef struct
   u32 **maps_by_out_fib;
   fib_source_t fib_src;
 
-  /* per thread state */
+  /* per thread state; each subscriber is owned by one thread */
   cgnat_per_thread_t *per_thread;
+  u32 first_worker_index;
+  u32 n_workers;
+  u32 fq_in2out_index;
+  u32 fq_out2in_index;
+  u32 fq_hairpin_index;
 
   /* policy */
   u32 timeouts[CGNAT_N_TO];
@@ -120,6 +125,7 @@ typedef struct
 extern cgnat_main_t cgnat_main;
 extern vlib_node_registration_t cgnat_in2out_node;
 extern vlib_node_registration_t cgnat_out2in_node;
+extern vlib_node_registration_t cgnat_hairpin_node;
 
 int cgnat_interface_add_del (u32 sw_if_index, int is_inside, int is_add);
 void cgnat_map_flush (u32 map_index);

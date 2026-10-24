@@ -593,5 +593,73 @@ class TestCgnatTimers(CgnatPgCase):
         self.assertEqual(len(self.sessions()), 1)
 
 
+class TestCgnatWorkers(TestCgnatTranslate):
+    """CGNAT translation with 2 workers (subscriber-owned threads, handoff)"""
+
+    vpp_worker_count = 2
+    n_inside_hosts = 64
+
+    def session_threads(self):
+        out = self.vapi.cli("show cgnat sessions")
+        return [int(l.split()[1]) for l in out.splitlines() if l.startswith("thread")]
+
+    def test_many_subscribers_spread(self):
+        """64 subscribers x 4 flows out and back; state spread over both workers"""
+        r = self.pg1.remote_ip4
+        pkts = [
+            self.in_pkt(self.host(i), 10000 + j, r, 53)
+            for i in range(64)
+            for j in range(4)
+        ]
+        rx = self.send_and_expect(self.pg0, pkts, self.pg1)
+        self.assertEqual(len(rx), 256)
+        replies = [self.out_pkt(r, 53, p[IP].src, p[UDP].sport) for p in rx]
+        back = self.send_and_expect(self.pg1, replies, self.pg0)
+        self.assertEqual(
+            sorted((p[IP].dst, p[UDP].dport) for p in back),
+            sorted((self.host(i), 10000 + j) for i in range(64) for j in range(4)),
+        )
+        threads = self.session_threads()
+        self.assertEqual(len(threads), 256)
+        self.assertEqual(set(threads), {1, 2})
+
+
+class TestCgnatPolicyWorkers(TestCgnatPolicy):
+    """CGNAT policy with 2 workers"""
+
+    vpp_worker_count = 2
+
+
+class TestCgnatIcmpWorkers(TestCgnatIcmp):
+    """CGNAT ICMP with 2 workers"""
+
+    vpp_worker_count = 2
+    n_inside_hosts = 16
+
+
+class TestCgnatHairpinWorkers(TestCgnatHairpin):
+    """CGNAT hairpinning with 2 workers, across subscribers owned by both"""
+
+    vpp_worker_count = 2
+    n_inside_hosts = 16
+
+    def test_hairpin_across_threads(self):
+        """Hairpin between every pair of 8 subscribers"""
+        self.vapi.cgnat_set_filtering(endpoint_independent=1)
+        r = self.pg1.remote_ip4
+        pub = {}
+        for i in range(8):
+            rx = self.in2out(self.host(i), 7000, r, 80)
+            pub[i] = (rx[IP].src, rx[UDP].sport)
+        for i in range(8):
+            for j in range(8):
+                if i == j:
+                    continue
+                p = self.in_pkt(self.host(i), 7000, *pub[j])
+                rx = self.send_and_expect(self.pg0, [p], self.pg0)[0]
+                self.assertEqual((rx[IP].dst, rx[UDP].dport), (self.host(j), 7000))
+                self.assertEqual((rx[IP].src, rx[UDP].sport), pub[i])
+
+
 if __name__ == "__main__":
     unittest.main(testRunner=VppTestRunner)
