@@ -340,6 +340,21 @@ show_cgnat_status_fn (vlib_main_t *vm, unformat_input_t *input,
 		   cm->timeouts[CGNAT_TO_ICMP]);
   vlib_cli_output (vm, "threads: %u workers from %u", cm->n_workers,
 		   cm->first_worker_index);
+  vlib_cli_output (
+    vm,
+    "packets: in2out %lu, out2in %lu, hairpin %lu, steered-out %lu, "
+    "steered-in %lu",
+    cgnat_counter_total (CGNAT_COUNTER_IN2OUT_PACKETS),
+    cgnat_counter_total (CGNAT_COUNTER_OUT2IN_PACKETS),
+    cgnat_counter_total (CGNAT_COUNTER_HAIRPIN_PACKETS),
+    cgnat_counter_total (CGNAT_COUNTER_STEERED_OUT),
+    cgnat_counter_total (CGNAT_COUNTER_STEERED_IN));
+  vlib_cli_output (
+    vm, "sync: records-out %lu, records-in %lu, retransmits %lu, overflow %lu",
+    cgnat_counter_total (CGNAT_COUNTER_SYNC_RECORDS_OUT),
+    cgnat_counter_total (CGNAT_COUNTER_SYNC_RECORDS_IN),
+    cgnat_counter_total (CGNAT_COUNTER_SYNC_RETRANSMITS),
+    cgnat_counter_total (CGNAT_COUNTER_SYNC_OVERFLOW));
   return 0;
 }
 

@@ -1,0 +1,9 @@
+unix { nodaemon cli-listen @RUN@/@N@.sock runtime-dir @RUN@/@N@ log @RUN@/@N@.log exec @RUN@/@N@.cli }
+api-segment { prefix vpp@N@ }
+socksvr { socket-name @RUN@/@N@-api.sock }
+statseg { socket-name @RUN@/@N@-stats.sock }
+cpu { main-core @MAIN@ corelist-workers @WORKERS@ }
+memory { main-heap-size 1G }
+buffers { buffers-per-numa 32768 }
+plugins { plugin dpdk_plugin.so { disable } }
+cgnat { sessions-per-subscriber 1000 @CLUSTER@ }

@@ -24,6 +24,7 @@ typedef struct
 #define foreach_cgnat_cluster_reason                                          \
   _ (NONE, "none")                                                            \
   _ (STARTING, "starting")                                                    \
+  _ (UNCONFIGURED, "unconfigured")                                            \
   _ (ALONE, "alone")                                                          \
   _ (RESYNCING, "resyncing")                                                  \
   _ (CONFIG_MISMATCH, "config-mismatch")                                      \

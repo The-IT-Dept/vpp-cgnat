@@ -1,0 +1,15 @@
+create tap id 0 host-ns rtr host-bridge br-in host-if-name @N@-in
+create tap id 1 host-ns rtr host-bridge br-out host-if-name @N@-out
+set interface state tap0 up
+set interface state tap1 up
+set interface ip address tap0 10.1.0.@IDX@/24
+set interface ip address tap1 10.2.0.@IDX@/24
+create memif socket id 1 filename /run/vpp-ha/memif.sock
+create interface memif socket-id 1 id 0 @MEMIF_ROLE@
+set interface state memif1/0 up
+set interface ip address memif1/0 10.255.0.@PAIR@/30
+ip route add 0.0.0.0/0 via 10.2.0.1 tap1
+ip route add 100.64.0.0/24 via 10.1.0.1 tap0
+cgnat map add inside 100.64.0.0/24 outside 192.0.2.0/28
+set interface cgnat in tap0
+set interface cgnat out tap1

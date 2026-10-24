@@ -264,6 +264,23 @@ class TestCgnatClusterHello(CgnatClusterCase):
         self.assertFalse(st.peer_alive)
         self.assertEqual((st.ready, st.reason), (False, "duplicate-node-id"))
 
+    def test_starting_waits_for_pair_address(self):
+        """No pair-link address on any interface yet: stay starting, never 'alone'"""
+        self.cluster_on(local="10.255.9.1", peer="10.255.9.2")
+        self.sleep(1.0)
+        st = self.status()
+        self.assertEqual((st.ready, st.reason), (False, "starting"))
+
+    def test_unconfigured_not_ready(self):
+        """No maps: never ready (can't become the serving node)"""
+        self.assertTrue(self.wait_for(lambda: self.status().ready))
+        for m in self.vapi.cgnat_map_dump():
+            self.vapi.cgnat_map_add_del(is_add=0, in_vrf=m.in_vrf, in_addr=m.in_addr,
+                                        in_plen=m.in_plen, out_vrf=m.out_vrf,
+                                        out_addr=m.out_addr, out_plen=m.out_plen)
+        self.assertTrue(self.wait_for(lambda: self.status().reason == "unconfigured"))
+        self.assertFalse(self.status().ready)
+
     def test_probe_path_hello(self):
         """Extra liveness path: HELLOs on it carry its path id"""
         self.vapi.cgnat_cluster_path_add_del(is_add=1, local=self.pg3.local_ip4,

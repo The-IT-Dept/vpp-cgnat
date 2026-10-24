@@ -16,6 +16,7 @@
 #include <vnet/ip/ip4.h>
 #include <vlib/stats/stats.h>
 #include <cgnat/cgnat.h>
+#include <cgnat/cgnat_inlines.h>
 
 char *cgnat_cluster_reason_strings[] = {
 #define _(sym, str) str,
@@ -190,6 +191,12 @@ cgnat_cluster_evaluate (vlib_main_t *vm, f64 now)
     }
   cl->pair_alive = vec_len (cl->paths) && cl->paths[0].alive;
 
+  /* starting lasts one dead interval from when our pair-link address
+     exists on an interface: until then we can't hear the peer, so we
+     must not conclude we're alone */
+  if (!vec_len (cl->paths) ||
+      !cgnat_is_local (cl->paths[0].fib_index, &cl->paths[0].local))
+    cl->enabled_at = now;
   starting = now - cl->enabled_at < cl->dead_interval;
   dup = cl->dup_last > 0 && now - cl->dup_last < cl->dead_interval;
   mismatch = cl->peer_alive && cl->peer_config_hash != cl->config_hash;
@@ -215,6 +222,13 @@ cgnat_cluster_evaluate (vlib_main_t *vm, f64 now)
     {
       cl->reason = CGNAT_REASON_STARTING;
       cl->ready = 0;
+    }
+  else if (pool_elts (cgnat_main.maps) == 0)
+    {
+      /* nothing to translate: never the serving node */
+      cl->reason = CGNAT_REASON_UNCONFIGURED;
+      cl->ready = 0;
+      cl->incumbent = 0;
     }
   else if (fence)
     {
@@ -278,7 +292,7 @@ cgnat_cluster_evaluate (vlib_main_t *vm, f64 now)
 	    !(cl->peer_state & CGNAT_HELLO_FENCED);
   if (cl->reason != CGNAT_REASON_CONFIG_MISMATCH)
     {
-      if (starting || dup)
+      if (starting || dup || cl->reason == CGNAT_REASON_UNCONFIGURED)
 	n = 0;
       else if (cl->fenced)
 	n = 1, a = cl->peer_node_id;
