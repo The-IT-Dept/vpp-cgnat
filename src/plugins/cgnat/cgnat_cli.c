@@ -385,3 +385,99 @@ VLIB_CLI_COMMAND (cgnat_max_sessions_command, static) = {
   .short_help = "cgnat max-sessions-per-thread <n>",
   .function = cgnat_max_sessions_fn,
 };
+
+static clib_error_t *
+cgnat_cluster_command_fn (vlib_main_t *vm, unformat_input_t *input,
+			  vlib_cli_command_t *cmd)
+{
+  ip4_address_t local = {}, peer = {};
+  u32 node_id = 0, table_id = 0, port = 0, hello = 0, dead = 0, refresh = 0;
+  int rv, is_add = 1, path = 0;
+
+  while (unformat_check_input (input) != UNFORMAT_END_OF_INPUT)
+    {
+      if (unformat (input, "disable"))
+	return cgnat_cluster_set (0, 0, 0, 0, 0, 0, 0, 0, 0) ?
+		 clib_error_return (0, "failed") :
+		 0;
+      else if (unformat (input, "path add"))
+	path = 1;
+      else if (unformat (input, "path del"))
+	path = 1, is_add = 0;
+      else if (unformat (input, "node-id %u", &node_id))
+	;
+      else if (unformat (input, "local %U", unformat_ip4_address, &local))
+	;
+      else if (unformat (input, "peer %U", unformat_ip4_address, &peer))
+	;
+      else if (unformat (input, "table %u", &table_id))
+	;
+      else if (unformat (input, "port %u", &port))
+	;
+      else if (unformat (input, "hello-interval %u", &hello))
+	;
+      else if (unformat (input, "dead-interval %u", &dead))
+	;
+      else if (unformat (input, "refresh-interval %u", &refresh))
+	;
+      else
+	return clib_error_return (0, "unknown input '%U'",
+				  format_unformat_error, input);
+    }
+  if (path)
+    rv = cgnat_cluster_path_add_del (&local, &peer, table_id, is_add);
+  else
+    rv = cgnat_cluster_set (1, node_id, &local, &peer, table_id, port, hello,
+			    dead, refresh);
+  if (rv)
+    return clib_error_return (0, "cgnat cluster failed: %U",
+			      format_vnet_api_errno, rv);
+  return 0;
+}
+
+VLIB_CLI_COMMAND (cgnat_cluster_command, static) = {
+  .path = "cgnat cluster",
+  .short_help = "cgnat cluster node-id <n> local <ip> peer <ip> [table <id>] "
+		"[port <n>] [hello-interval <ms>] [dead-interval <ms>] "
+		"[refresh-interval <s>] | path add|del local <ip> peer <ip> "
+		"[table <id>] | disable",
+  .function = cgnat_cluster_command_fn,
+};
+
+static clib_error_t *
+show_cgnat_cluster_fn (vlib_main_t *vm, unformat_input_t *input,
+		       vlib_cli_command_t *cmd)
+{
+  cgnat_cluster_t *cl = &cgnat_main.cluster;
+  f64 now = vlib_time_now (vm);
+  cgnat_path_t *p;
+
+  if (!cl->enabled)
+    {
+      vlib_cli_output (vm, "cluster: disabled (alone, ready)");
+      return 0;
+    }
+  vlib_cli_output (vm, "node %u epoch %08x: %s, %s, config %08x",
+		   cl->node_id, cl->epoch, cl->ready ? "ready" : "not ready",
+		   cgnat_cluster_reason_strings[cl->reason],
+		   cgnat_config_hash ());
+  vlib_cli_output (vm, "peer node %u epoch %08x: %s%s%s, config %08x",
+		   cl->peer_node_id, cl->peer_epoch,
+		   cl->peer_alive ? "alive" : "dead",
+		   (cl->peer_state & CGNAT_HELLO_READY) ? ", ready" : "",
+		   (cl->peer_state & CGNAT_HELLO_FENCED) ? ", fenced" : "",
+		   cl->peer_config_hash);
+  vec_foreach (p, cl->paths)
+    vlib_cli_output (vm, "  path %u %U -> %U table %u: %s (%.2fs ago)",
+		     p - cl->paths, format_ip4_address, &p->local,
+		     format_ip4_address, &p->peer, p->table_id,
+		     p->alive ? "alive" : "dead",
+		     p->last_rx > 0 ? now - p->last_rx : -1.0);
+  return 0;
+}
+
+VLIB_CLI_COMMAND (show_cgnat_cluster_command, static) = {
+  .path = "show cgnat cluster",
+  .short_help = "show cgnat cluster",
+  .function = show_cgnat_cluster_fn,
+};

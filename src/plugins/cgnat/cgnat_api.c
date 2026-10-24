@@ -267,6 +267,68 @@ vl_api_cgnat_get_status_t_handler (vl_api_cgnat_get_status_t *mp)
   }));
 }
 
+static void
+vl_api_cgnat_cluster_set_t_handler (vl_api_cgnat_cluster_set_t *mp)
+{
+  cgnat_main_t *cm = &cgnat_main;
+  vl_api_cgnat_cluster_set_reply_t *rmp;
+  ip4_address_t local, peer;
+  int rv;
+
+  ip4_address_decode (mp->local, &local);
+  ip4_address_decode (mp->peer, &peer);
+  rv = cgnat_cluster_set (mp->enable, mp->node_id, &local, &peer,
+			  ntohl (mp->table_id), ntohs (mp->port),
+			  ntohl (mp->hello_interval_ms),
+			  ntohl (mp->dead_interval_ms),
+			  ntohl (mp->refresh_interval_s));
+  REPLY_MACRO (VL_API_CGNAT_CLUSTER_SET_REPLY);
+}
+
+static void
+vl_api_cgnat_cluster_path_add_del_t_handler (
+  vl_api_cgnat_cluster_path_add_del_t *mp)
+{
+  cgnat_main_t *cm = &cgnat_main;
+  vl_api_cgnat_cluster_path_add_del_reply_t *rmp;
+  ip4_address_t local, peer;
+  int rv;
+
+  ip4_address_decode (mp->local, &local);
+  ip4_address_decode (mp->peer, &peer);
+  rv = cgnat_cluster_path_add_del (&local, &peer, ntohl (mp->table_id),
+				   mp->is_add);
+  REPLY_MACRO (VL_API_CGNAT_CLUSTER_PATH_ADD_DEL_REPLY);
+}
+
+static void
+vl_api_cgnat_cluster_get_status_t_handler (
+  vl_api_cgnat_cluster_get_status_t *mp)
+{
+  cgnat_main_t *cm = &cgnat_main;
+  cgnat_cluster_t *cl = &cm->cluster;
+  vl_api_cgnat_cluster_get_status_reply_t *rmp;
+  int rv = 0;
+
+  REPLY_MACRO2 (VL_API_CGNAT_CLUSTER_GET_STATUS_REPLY, ({
+    rmp->enabled = cl->enabled;
+    rmp->node_id = cl->node_id;
+    rmp->peer_node_id = cl->peer_node_id;
+    rmp->ready = cl->enabled ? cl->ready : 1;
+    rmp->fenced = cl->fenced;
+    strncpy ((char *) rmp->reason,
+	     cl->enabled ? cgnat_cluster_reason_strings[cl->reason] : "alone",
+	     sizeof (rmp->reason) - 1);
+    rmp->peer_alive = cl->peer_alive;
+    rmp->pair_alive = cl->pair_alive;
+    rmp->peer_ready = cl->peer_alive && (cl->peer_state & CGNAT_HELLO_READY);
+    rmp->config_hash = htonl (cgnat_config_hash ());
+    rmp->peer_config_hash = htonl (cl->peer_config_hash);
+    rmp->epoch = htonl (cl->epoch);
+    rmp->peer_epoch = htonl (cl->peer_epoch);
+  }));
+}
+
 #include <vnet/format_fns.h>
 #include <cgnat/cgnat.api.c>
 

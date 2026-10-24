@@ -11,6 +11,8 @@ add_vpp_plugin(cgnat
   cgnat_in2out.c
   cgnat_out2in.c
   cgnat_expire.c
+  cgnat_cluster.c
+  cgnat_cluster_input.c
 
   MULTIARCH_SOURCES
   cgnat_in2out.c

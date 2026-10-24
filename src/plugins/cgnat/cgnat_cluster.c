@@ -1,0 +1,351 @@
+/*
+ * SPDX-License-Identifier: Apache-2.0
+ * Copyright (c) 2026 The vpp-cgnat authors
+ */
+
+/*
+ * Pair membership: configuration, HELLOs on every path, liveness, the
+ * config hash, and the ready / serving decision.  A process on the main
+ * thread does all of the evaluation each hello interval; the input node
+ * only records what it hears.
+ */
+
+#include <vnet/fib/fib_table.h>
+#include <vnet/udp/udp_local.h>
+#include <vnet/udp/udp_packet.h>
+#include <vnet/ip/ip4.h>
+#include <vlib/stats/stats.h>
+#include <cgnat/cgnat.h>
+
+char *cgnat_cluster_reason_strings[] = {
+#define _(sym, str) str,
+  foreach_cgnat_cluster_reason
+#undef _
+};
+
+enum
+{
+  CGNAT_CLUSTER_EVENT_CHANGED = 1,
+};
+
+u32
+cgnat_config_hash (void)
+{
+  cgnat_main_t *cm = &cgnat_main;
+  cgnat_cluster_t *cl = &cm->cluster;
+  cgnat_map_t *m;
+  u64 h = 0;
+  int i;
+
+  /* order-independent over maps */
+  pool_foreach (m, cm->maps)
+    {
+      u64 in = (u64) m->in_table_id << 40 | (u64) m->in_plen << 32 |
+	       m->in_base.as_u32;
+      u64 out = (u64) m->out_table_id << 40 | (u64) m->out_plen << 32 |
+		m->out_base.as_u32;
+      h += clib_xxhash (in) ^ (clib_xxhash (out) * 31);
+    }
+  for (i = 0; i < CGNAT_N_TO; i++)
+    h = clib_xxhash (h ^ ((u64) (i + 1) << 32 | cm->timeouts[i]));
+  h = clib_xxhash (h ^ (u64) cm->sessions_per_sub << 32 ^
+		   cm->inbound_sessions_per_sub);
+  h = clib_xxhash (h ^ (u64) cm->endpoint_independent_filtering << 48 ^
+		   cm->max_sessions_per_thread);
+  h = clib_xxhash (h ^ (u64) (cl->hello_interval * 1e3) << 32 ^
+		   (u64) (cl->dead_interval * 1e3));
+  h = clib_xxhash (h ^ (u64) cl->refresh_interval);
+  return (u32) (h ^ (h >> 32));
+}
+
+vlib_buffer_t *
+cgnat_cluster_alloc (vlib_main_t *vm, u32 path, u8 type, u32 seq,
+		     u32 body_len, void **body, u32 *bi)
+{
+  cgnat_cluster_t *cl = &cgnat_main.cluster;
+  cgnat_path_t *p = vec_elt_at_index (cl->paths, path);
+  ip4_header_t *ip;
+  udp_header_t *udp;
+  cgnat_msg_hdr_t *h;
+  vlib_buffer_t *b;
+  u16 len = sizeof (*ip) + sizeof (*udp) + sizeof (*h) + body_len;
+
+  if (vlib_buffer_alloc (vm, bi, 1) != 1)
+    return 0;
+  b = vlib_get_buffer (vm, *bi);
+  b->current_data = 0;
+  b->current_length = len;
+  b->flags |= VNET_BUFFER_F_LOCALLY_ORIGINATED;
+  vnet_buffer (b)->sw_if_index[VLIB_RX] = 0;
+  vnet_buffer (b)->sw_if_index[VLIB_TX] = p->fib_index;
+
+  ip = vlib_buffer_get_current (b);
+  clib_memset (ip, 0, sizeof (*ip));
+  ip->ip_version_and_header_length = 0x45;
+  ip->ttl = 64;
+  ip->protocol = IP_PROTOCOL_UDP;
+  ip->length = clib_host_to_net_u16 (len);
+  ip->src_address = p->local;
+  ip->dst_address = p->peer;
+  ip->checksum = ip4_header_checksum (ip);
+
+  udp = (udp_header_t *) (ip + 1);
+  udp->src_port = udp->dst_port = clib_host_to_net_u16 (cl->port);
+  udp->length = clib_host_to_net_u16 (len - sizeof (*ip));
+  udp->checksum = 0;
+
+  h = (cgnat_msg_hdr_t *) (udp + 1);
+  h->version = CGNAT_PROTO_VERSION;
+  h->type = type;
+  h->flags = 0;
+  h->node_id = cl->node_id;
+  h->config_hash = clib_host_to_net_u32 (cl->config_hash);
+  h->epoch = clib_host_to_net_u32 (cl->epoch);
+  h->seq = clib_host_to_net_u32 (seq);
+  *body = h + 1;
+  return b;
+}
+
+void
+cgnat_cluster_send (vlib_main_t *vm, u32 *bis, u32 n)
+{
+  vlib_frame_t *f;
+  u32 *to;
+
+  while (n)
+    {
+      u32 k = clib_min (n, VLIB_FRAME_SIZE);
+      f = vlib_get_frame_to_node (vm, ip4_lookup_node.index);
+      to = vlib_frame_vector_args (f);
+      vlib_buffer_copy_indices (to, bis, k);
+      f->n_vectors = k;
+      vlib_put_frame_to_node (vm, ip4_lookup_node.index, f);
+      bis += k;
+      n -= k;
+    }
+}
+
+static void
+cgnat_cluster_send_hellos (vlib_main_t *vm)
+{
+  cgnat_main_t *cm = &cgnat_main;
+  cgnat_cluster_t *cl = &cm->cluster;
+  u32 *bis = 0, bi, i;
+
+  vec_foreach_index (i, cl->paths)
+    {
+      cgnat_msg_hello_t *hb;
+      if (!cgnat_cluster_alloc (vm, i, CGNAT_MSG_HELLO, 0, sizeof (*hb),
+				(void **) &hb, &bi))
+	break;
+      hb->path_id = i;
+      hb->state = (cl->ready ? CGNAT_HELLO_READY : 0) |
+		  (cl->fenced ? CGNAT_HELLO_FENCED : 0);
+      hb->n_workers = clib_host_to_net_u16 (cm->n_workers);
+      hb->first_worker = clib_host_to_net_u16 (cm->first_worker_index);
+      hb->pad = 0;
+      vec_add1 (bis, bi);
+    }
+  cgnat_cluster_send (vm, bis, vec_len (bis));
+  vec_free (bis);
+}
+
+/* evaluate liveness and readiness; runs on main each hello interval */
+static void
+cgnat_cluster_evaluate (vlib_main_t *vm, f64 now)
+{
+  cgnat_cluster_t *cl = &cgnat_main.cluster;
+  cgnat_path_t *p;
+  int starting, dup, mismatch;
+
+  cl->config_hash = cgnat_config_hash ();
+  cl->peer_alive = 0;
+  vec_foreach (p, cl->paths)
+    {
+      p->alive = p->last_rx > 0 && now - p->last_rx < cl->dead_interval;
+      cl->peer_alive |= p->alive;
+    }
+  cl->pair_alive = vec_len (cl->paths) && cl->paths[0].alive;
+
+  starting = now - cl->enabled_at < cl->dead_interval;
+  dup = cl->dup_last > 0 && now - cl->dup_last < cl->dead_interval;
+  mismatch = cl->peer_alive && cl->peer_config_hash != cl->config_hash;
+
+  if (dup)
+    {
+      cl->reason = CGNAT_REASON_DUPLICATE;
+      cl->ready = 0;
+    }
+  else if (starting)
+    {
+      cl->reason = CGNAT_REASON_STARTING;
+      cl->ready = 0;
+    }
+  else if (!cl->peer_alive)
+    {
+      cl->reason = CGNAT_REASON_ALONE;
+      cl->ready = 1;
+    }
+  else if (mismatch)
+    {
+      cl->reason = CGNAT_REASON_CONFIG_MISMATCH;
+      cl->ready = 0;
+    }
+  else
+    {
+      cl->reason = CGNAT_REASON_NONE;
+      cl->ready = 1;
+    }
+  cl->serving = !starting && !dup;
+
+  vlib_stats_set_gauge (cl->ready_gauge, cl->ready);
+  vlib_stats_set_gauge (cl->peer_alive_gauge, cl->peer_alive);
+  vlib_stats_set_gauge (cl->fenced_gauge, cl->fenced);
+}
+
+static uword
+cgnat_cluster_process (vlib_main_t *vm, vlib_node_runtime_t *rt,
+		       vlib_frame_t *f)
+{
+  cgnat_cluster_t *cl = &cgnat_main.cluster;
+
+  while (1)
+    {
+      if (!cl->enabled)
+	vlib_process_wait_for_event (vm);
+      else
+	vlib_process_wait_for_event_or_clock (vm, cl->hello_interval);
+      vlib_process_get_events (vm, 0);
+      if (!cl->enabled)
+	continue;
+      cgnat_cluster_evaluate (vm, vlib_time_now (vm));
+      cgnat_cluster_send_hellos (vm);
+    }
+  return 0;
+}
+
+VLIB_REGISTER_NODE (cgnat_cluster_process_node) = {
+  .function = cgnat_cluster_process,
+  .type = VLIB_NODE_TYPE_PROCESS,
+  .name = "cgnat-cluster-process",
+};
+
+static int
+path_init (cgnat_path_t *p, ip4_address_t *local, ip4_address_t *peer,
+	   u32 table_id)
+{
+  clib_memset (p, 0, sizeof (*p));
+  p->local = *local;
+  p->peer = *peer;
+  p->table_id = table_id;
+  p->fib_index = fib_table_find_or_create_and_lock (
+    FIB_PROTOCOL_IP4, table_id, cgnat_main.fib_src);
+  return 0;
+}
+
+static void
+path_free (cgnat_path_t *p)
+{
+  fib_table_unlock (p->fib_index, FIB_PROTOCOL_IP4, cgnat_main.fib_src);
+}
+
+int
+cgnat_cluster_set (int enable, u8 node_id, ip4_address_t *local,
+		   ip4_address_t *peer, u32 table_id, u16 port, u32 hello_ms,
+		   u32 dead_ms, u32 refresh_s)
+{
+  cgnat_main_t *cm = &cgnat_main;
+  cgnat_cluster_t *cl = &cm->cluster;
+  vlib_main_t *vm = vlib_get_main ();
+  cgnat_path_t *p;
+
+  if (cl->enabled)
+    {
+      /* reconfigure = disable then enable */
+      vec_foreach (p, cl->paths)
+	path_free (p);
+      vec_free (cl->paths);
+      udp_unregister_dst_port (vm, cl->port, 1);
+      cl->enabled = 0;
+      cl->ready = 0;
+      cl->serving = 1;
+    }
+  if (!enable)
+    return 0;
+
+  if (node_id == 0 || local->as_u32 == 0 || peer->as_u32 == 0)
+    return VNET_API_ERROR_INVALID_VALUE;
+
+  cl->node_id = node_id;
+  cl->port = port ? port : CGNAT_CLUSTER_PORT;
+  cl->hello_interval = (hello_ms ? hello_ms : 100) * 1e-3;
+  cl->dead_interval = (dead_ms ? dead_ms : 500) * 1e-3;
+  cl->refresh_interval = refresh_s ? refresh_s : 10;
+  if (cl->dead_interval <= cl->hello_interval)
+    return VNET_API_ERROR_INVALID_VALUE;
+
+  vec_add2 (cl->paths, p, 1);
+  path_init (p, local, peer, table_id);
+
+  cl->epoch = (u32) (clib_cpu_time_now () ^ (clib_cpu_time_now () >> 32)) | 1;
+  cl->peer_node_id = 0;
+  cl->peer_epoch = 0;
+  cl->peer_state = 0;
+  cl->dup_last = 0;
+  cl->peer_alive = cl->pair_alive = cl->ready = cl->fenced = 0;
+  cl->serving = 0;
+  cl->reason = CGNAT_REASON_STARTING;
+  cl->enabled_at = vlib_time_now (vm);
+  cl->config_hash = cgnat_config_hash ();
+  udp_register_dst_port (vm, cl->port, cgnat_cluster_input_node.index, 1);
+  cl->enabled = 1;
+  vlib_process_signal_event (vm, cgnat_cluster_process_node.index,
+			     CGNAT_CLUSTER_EVENT_CHANGED, 0);
+  return 0;
+}
+
+int
+cgnat_cluster_path_add_del (ip4_address_t *local, ip4_address_t *peer,
+			    u32 table_id, int is_add)
+{
+  cgnat_cluster_t *cl = &cgnat_main.cluster;
+  cgnat_path_t *p;
+  u32 i;
+
+  if (!cl->enabled)
+    return VNET_API_ERROR_FEATURE_DISABLED;
+  for (i = 1; i < vec_len (cl->paths); i++)
+    {
+      p = vec_elt_at_index (cl->paths, i);
+      if (p->local.as_u32 == local->as_u32 && p->peer.as_u32 == peer->as_u32)
+	{
+	  if (is_add)
+	    return VNET_API_ERROR_VALUE_EXIST;
+	  path_free (p);
+	  vec_del1 (cl->paths, i); /* path ids after it shift down */
+	  return 0;
+	}
+    }
+  if (!is_add)
+    return VNET_API_ERROR_NO_SUCH_ENTRY;
+  if (vec_len (cl->paths) >= 5)
+    return VNET_API_ERROR_LIMIT_EXCEEDED;
+  vec_add2 (cl->paths, p, 1);
+  return path_init (p, local, peer, table_id);
+}
+
+static clib_error_t *
+cgnat_cluster_init (vlib_main_t *vm)
+{
+  cgnat_cluster_t *cl = &cgnat_main.cluster;
+
+  cl->serving = 1; /* no cluster: a lone node always translates */
+  cl->ready_gauge = vlib_stats_add_gauge ("/cgnat/cluster/ready");
+  cl->peer_alive_gauge = vlib_stats_add_gauge ("/cgnat/cluster/peer-alive");
+  cl->fenced_gauge = vlib_stats_add_gauge ("/cgnat/cluster/fenced");
+  return 0;
+}
+
+VLIB_INIT_FUNCTION (cgnat_cluster_init) = {
+  .runs_after = VLIB_INITS ("cgnat_init"),
+};

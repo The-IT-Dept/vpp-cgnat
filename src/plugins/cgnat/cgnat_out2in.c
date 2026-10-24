@@ -18,6 +18,7 @@
   _ (UNSUPPORTED, "unsupported", "protocol not translated")                   \
   _ (TRUNCATED, "truncated", "L4 header truncated")                           \
   _ (OPTIONS, "options", "IPv4 options not translated")                       \
+  _ (NOT_READY, "not-ready", "cluster node not serving yet")                  \
   _ (TO_INSIDE, "to-inside", "outside traffic addressed to an inside prefix") \
   _ (TABLE_FULL, "table-full", "thread session table full")                   \
   _ (CONGESTION, "congestion", "handoff queue full")
@@ -151,6 +152,11 @@ cgnat_out2in_one (vlib_main_t *vm, vlib_node_runtime_t *node,
   if (PREDICT_FALSE (ip->ip_version_and_header_length != 0x45))
     {
       b->error = node->errors[CGNAT_OUT2IN_ERROR_OPTIONS];
+      return CGNAT_OUT2IN_NEXT_DROP;
+    }
+  if (PREDICT_FALSE (!cgnat_main.cluster.serving))
+    {
+      b->error = node->errors[CGNAT_OUT2IN_ERROR_NOT_READY];
       return CGNAT_OUT2IN_NEXT_DROP;
     }
 

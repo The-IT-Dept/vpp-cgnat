@@ -171,6 +171,51 @@ cgnat_config (vlib_main_t *vm, unformat_input_t *input)
 				      format_unformat_error, &sub);
 	  unformat_free (&sub);
 	}
+      else if (unformat (input, "cluster %U", unformat_vlib_cli_sub_input,
+			 &sub))
+	{
+	  typeof (cm->cluster.startup) *c = &cm->cluster.startup;
+	  ip4_address_t pl, pp;
+	  u32 pt = 0;
+
+	  c->set = 1;
+	  while (unformat_check_input (&sub) != UNFORMAT_END_OF_INPUT)
+	    {
+	      if (unformat (&sub, "node-id %u", &n))
+		c->node_id = n;
+	      else if (unformat (&sub, "local %U", unformat_ip4_address,
+				 &c->local))
+		;
+	      else if (unformat (&sub, "peer %U", unformat_ip4_address,
+				 &c->peer))
+		;
+	      else if (unformat (&sub, "table %u", &c->table_id))
+		;
+	      else if (unformat (&sub, "port %u", &c->port))
+		;
+	      else if (unformat (&sub, "hello-interval %u", &c->hello_ms))
+		;
+	      else if (unformat (&sub, "dead-interval %u", &c->dead_ms))
+		;
+	      else if (unformat (&sub, "refresh-interval %u", &c->refresh_s))
+		;
+	      else if (unformat (&sub, "path local %U peer %U table %u",
+				 unformat_ip4_address, &pl,
+				 unformat_ip4_address, &pp, &pt) ||
+		       (pt = 0, unformat (&sub, "path local %U peer %U",
+					  unformat_ip4_address, &pl,
+					  unformat_ip4_address, &pp)))
+		{
+		  vec_add1 (c->path_local, pl);
+		  vec_add1 (c->path_peer, pp);
+		  vec_add1 (c->path_table, pt);
+		}
+	      else
+		return clib_error_return (0, "cgnat cluster: unknown '%U'",
+					  format_unformat_error, &sub);
+	    }
+	  unformat_free (&sub);
+	}
       else if (unformat (input, "filtering endpoint-independent"))
 	cm->endpoint_independent_filtering = 1;
       else if (unformat (input, "filtering address-dependent"))
@@ -198,6 +243,24 @@ cgnat_main_loop_enter (vlib_main_t *vm)
   cm->fq_out2in_index = vlib_frame_queue_main_init (cgnat_out2in_node.index, 0);
   cm->fq_hairpin_index =
     vlib_frame_queue_main_init (cgnat_hairpin_node.index, 0);
+
+  /* cluster from startup.conf */
+  {
+    typeof (cm->cluster.startup) *c = &cm->cluster.startup;
+    u32 i;
+    if (c->set)
+      {
+	int rv = cgnat_cluster_set (1, c->node_id, &c->local, &c->peer,
+				    c->table_id, c->port, c->hello_ms,
+				    c->dead_ms, c->refresh_s);
+	if (rv)
+	  return clib_error_return (0, "cgnat cluster: startup config: %U",
+				    format_vnet_api_errno, rv);
+	vec_foreach_index (i, c->path_local)
+	  cgnat_cluster_path_add_del (&c->path_local[i], &c->path_peer[i],
+				      c->path_table[i], 1);
+      }
+  }
   return 0;
 }
 

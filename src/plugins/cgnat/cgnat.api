@@ -176,3 +176,57 @@ define cgnat_get_status_reply {
   u32 udp_timeout;
   u32 icmp_timeout;
 };
+
+/** \brief Enable/disable the HA pair on this node
+    @param node_id - this node's id (1..255, unique in the pair)
+    @param local / peer - pair-link addresses
+    @param table_id - table the pair link is in
+    @param port - UDP port (0: 6200)
+    @param hello_interval_ms / dead_interval_ms / refresh_interval_s - 0: defaults 100 / 500 / 10
+*/
+autoreply define cgnat_cluster_set {
+  u32 client_index;
+  u32 context;
+  bool enable;
+  u8 node_id;
+  vl_api_ip4_address_t local;
+  vl_api_ip4_address_t peer;
+  u32 table_id;
+  u16 port;
+  u32 hello_interval_ms;
+  u32 dead_interval_ms;
+  u32 refresh_interval_s;
+};
+
+/** \brief Add/delete an extra liveness path (inside/outside networks) */
+autoreply define cgnat_cluster_path_add_del {
+  u32 client_index;
+  u32 context;
+  bool is_add;
+  vl_api_ip4_address_t local;
+  vl_api_ip4_address_t peer;
+  u32 table_id;
+};
+
+define cgnat_cluster_get_status {
+  u32 client_index;
+  u32 context;
+};
+
+define cgnat_cluster_get_status_reply {
+  u32 context;
+  i32 retval;
+  bool enabled;
+  u8 node_id;
+  u8 peer_node_id;
+  bool ready;
+  bool fenced;
+  string reason[32];
+  bool peer_alive;
+  bool pair_alive;
+  bool peer_ready;
+  u32 config_hash;
+  u32 peer_config_hash;
+  u32 epoch;
+  u32 peer_epoch;
+};

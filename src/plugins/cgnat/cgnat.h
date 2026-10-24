@@ -14,6 +14,7 @@
 #include <vppinfra/bihash_8_8.h>
 #include <vppinfra/dlist.h>
 #include <cgnat/cgnat_map.h>
+#include <cgnat/cgnat_cluster.h>
 
 typedef enum
 {
@@ -138,6 +139,9 @@ typedef struct
    * are never negative and their sum is the total).
    */
   vlib_simple_counter_main_t counters[CGNAT_N_COUNTER];
+
+  /* the HA pair */
+  cgnat_cluster_t cluster;
 
   /* interfaces with translation enabled */
   uword *inside_ifs;
