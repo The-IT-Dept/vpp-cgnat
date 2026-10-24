@@ -19,14 +19,14 @@ from asfframework import VppTestRunner
 PORT = 6200
 HELLO, STEER, SYNC, ACK, RESYNC_REQ, RESYNC_END = 1, 2, 3, 4, 5, 6
 HDR = struct.Struct("!BBBBIII")  # version type flags node_id config_hash epoch seq
-HELLO_BODY = struct.Struct("!BBHHH")  # path_id state n_workers first_worker pad
+HELLO_BODY = struct.Struct("!BBHHHI")  # path_id state n_workers first_worker pad heard_epoch
 STEER_BODY = struct.Struct("!BBBBIHH")  # direction reass_flags flags_or_type pad table_id sport dport
 REASS_NON_FIRST, REASS_TRUNCATED = 1, 2
-SYNC_BODY = struct.Struct("!HHHH")  # src_thread dst_thread n_records pad
+SYNC_BODY = struct.Struct("!HHHHI")  # src_thread dst_thread n_records pad oldest_unacked
 ACK_BODY = struct.Struct("!HHI")  # src_thread dst_thread pad
 END_BODY = struct.Struct("!HH")  # src_thread n_src_threads
 RECORD = struct.Struct("!BBBBIIIHHIHHI")  # 32 bytes
-READY, FENCED, WANT_RESYNC = 1, 2, 4
+READY, FENCED, WANT_RESYNC, PEER_IN_ACTIVE = 1, 2, 4, 8
 
 
 def ip2int(a):
@@ -48,7 +48,7 @@ def parse(payload):
 
 
 def parse_records(body):
-    src, dst, n, _ = SYNC_BODY.unpack_from(body)
+    src, dst, n, _, _ = SYNC_BODY.unpack_from(body)
     recs = []
     for i in range(n):
         f = RECORD.unpack_from(body, SYNC_BODY.size + i * RECORD.size)
@@ -150,18 +150,20 @@ class CgnatClusterCase(VppTestCase):
         return self.statistics.get_err_counter("/err/%s/%s" % (node, name))
 
     def msg(self, mtype, body=b"", seq=0, node_id=None, config_hash=None, epoch=None,
-            path=0):
+            path=0, ttl=255, src=None):
         st = self.status()
         hdr = HDR.pack(1, mtype, 0, self.peer_id if node_id is None else node_id,
                        st.config_hash if config_hash is None else config_hash,
                        self.epoch if epoch is None else epoch, seq)
         itf = self.pg2 if path == 0 else self.pg3
         return (Ether(src=itf.remote_mac, dst=itf.local_mac)
-                / IP(src=itf.remote_ip4, dst=itf.local_ip4)
+                / IP(src=src or itf.remote_ip4, dst=itf.local_ip4, ttl=ttl)
                 / UDP(sport=PORT, dport=PORT) / Raw(hdr + body))
 
-    def hello(self, state=READY, path=0, n_workers=0, first_worker=0, **kw):
-        return self.msg(HELLO, HELLO_BODY.pack(path, state, n_workers, first_worker, 0),
+    def hello(self, state=READY | PEER_IN_ACTIVE, path=0, n_workers=0, first_worker=0,
+              heard_epoch=None, **kw):
+        heard = self.status().epoch if heard_epoch is None else heard_epoch
+        return self.msg(HELLO, HELLO_BODY.pack(path, state, n_workers, first_worker, 0, heard),
                         path=path, **kw)
 
     def send_peer(self, pkts, itf=None):
@@ -255,7 +257,8 @@ class TestCgnatClusterHello(CgnatClusterCase):
         self.wait_for(lambda: self.status().ready)
         self.keep_hello(0.6, config_hash=0xDEADBEEF)
         st = self.status()
-        self.assertEqual((st.ready, st.reason), (False, "config-mismatch"))
+        # the serving node stays in routing and raises the alarm
+        self.assertEqual((st.ready, st.reason), (True, "config-mismatch"))
 
     def test_duplicate_node_id_refused(self):
         """A peer using our node id is never alive; duplicate-node-id"""
@@ -263,6 +266,32 @@ class TestCgnatClusterHello(CgnatClusterCase):
         st = self.status()
         self.assertFalse(st.peer_alive)
         self.assertEqual((st.ready, st.reason), (False, "duplicate-node-id"))
+
+    def test_hello_ttl_not_255_ignored(self):
+        """Pair-link HELLOs must arrive with TTL 255 (GTSM)"""
+        self.keep_hello(0.8, ttl=64)
+        self.assertFalse(self.status().peer_alive)
+
+    def test_one_way_hello_not_alive(self):
+        """A peer that doesn't hear us (wrong heard_epoch) is not alive"""
+        self.keep_hello(0.8, heard_epoch=0x99)
+        self.assertFalse(self.status().peer_alive)
+
+    def test_duplicate_id_from_unknown_source_ignored(self):
+        """A packet claiming our node id from a non-path source changes nothing"""
+        self.assertTrue(self.wait_for(lambda: self.status().ready))
+        self.keep_hello(0.8, node_id=1, src="10.99.99.99")
+        st = self.status()
+        self.assertEqual((st.ready, st.reason), (True, "alone"))
+
+    def test_bad_reconfig_keeps_cluster(self):
+        """An invalid reconfigure is refused and the running cluster stays as it was"""
+        e = self.status().epoch
+        with self.vapi.assert_negative_api_retval():
+            self.cluster_on(hello_interval_ms=500, dead_interval_ms=100)
+        st = self.status()
+        self.assertTrue(st.enabled)
+        self.assertEqual(st.epoch, e)
 
     def test_starting_waits_for_pair_address(self):
         """No pair-link address on any interface yet: stay starting, never 'alone'"""
@@ -356,7 +385,7 @@ class TestCgnatClusterOwner(CgnatOwnerCase):
         before = self.owners()
         self.keep_hello(0.5, config_hash=0xDEADBEEF)
         st = self.status()
-        self.assertEqual((st.ready, st.reason), (False, "config-mismatch"))
+        self.assertEqual((st.ready, st.reason), (True, "config-mismatch"))
         self.assertEqual(self.owners(), before)
 
 
@@ -365,6 +394,16 @@ class TestCgnatClusterFence(CgnatOwnerCase):
 
     node_id = 2
     peer_id = 1
+
+    def test_returning_peer_same_epoch_higher_id_resyncs(self):
+        """Peer back after a gap with the same epoch: the higher id resyncs from it"""
+        self.keep_hello(0.5)
+        self.assertTrue(self.wait_for(lambda: not self.status().peer_alive, timeout=4))
+        self.pg2.enable_capture()
+        self.keep_hello(0.5)
+        st = self.status()
+        self.assertEqual(st.reason, "resyncing")
+        self.assertTrue(self.capture_msgs(self.pg2, RESYNC_REQ))
 
     def test_fence_higher_id(self):
         """Pair link down, peer alive on a probe path, we have the higher id: fenced"""
@@ -535,9 +574,10 @@ class TestCgnatClusterSync(CgnatSteerHelpers):
     def ack(self, seq, src_thread=0, dst_thread=0):
         return self.msg(ACK, ACK_BODY.pack(src_thread, dst_thread, 0), seq=seq)
 
-    def sync_msg(self, seq, records, src_thread=0, dst_thread=0):
-        return self.msg(SYNC, SYNC_BODY.pack(src_thread, dst_thread, len(records), 0)
-                        + b"".join(records), seq=seq)
+    def sync_msg(self, seq, records, src_thread=0, dst_thread=0, oldest=None, **kw):
+        return self.msg(SYNC, SYNC_BODY.pack(src_thread, dst_thread, len(records), 0,
+                                             seq if oldest is None else oldest)
+                        + b"".join(records), seq=seq, **kw)
 
     def sessions(self, host):
         return list(self.vapi.cgnat_session_dump(in_vrf=0, in_addr=host))
@@ -646,6 +686,84 @@ class TestCgnatClusterSync(CgnatSteerHelpers):
         finally:
             self.vapi.cli("cgnat cluster window 1024")
 
+    def test_record_outside_block_rejected(self):
+        """A record whose public ip:port isn't the subscriber's block is rejected"""
+        mine, theirs = self.split()
+        f = self.vapi.cgnat_forward(in_vrf=0, in_addr=theirs[0])
+        before = self.err("cgnat-sync-worker", "sync-bad-record")
+        bad = f.port_hi + 1 if f.port_hi < 65535 else f.port_lo - 1
+        rec = record(1, theirs[0], 7000, str(f.out_addr), bad, self.pg1.remote_ip4, 53)
+        self.send_peer(self.sync_msg(0, [rec]))
+        self.sleep(0.1)
+        self.assertEqual(self.sessions(theirs[0]), [])
+        self.assertEqual(self.err("cgnat-sync-worker", "sync-bad-record") - before, 1)
+
+    def test_sync_from_non_pair_source_rejected(self):
+        """SYNC must come from the pair-link peer with TTL 255"""
+        mine, theirs = self.split()
+        f = self.vapi.cgnat_forward(in_vrf=0, in_addr=theirs[0])
+        rec = record(1, theirs[0], 7000, str(f.out_addr), f.port_lo + 1,
+                     self.pg1.remote_ip4, 53)
+        self.send_peer(self.sync_msg(0, [rec], ttl=64))
+        self.send_peer(self.sync_msg(0, [rec], src="10.98.0.1"))
+        self.sleep(0.1)
+        self.assertEqual(self.sessions(theirs[0]), [])
+
+    def test_receiver_skips_abandoned_seqs(self):
+        """The sender's oldest-unacked lets the receiver step over seqs it gave up on"""
+        mine, theirs = self.split()
+        f = self.vapi.cgnat_forward(in_vrf=0, in_addr=theirs[0])
+        mk = lambda p: record(1, theirs[0], p, str(f.out_addr), f.port_lo + p % 100,
+                              self.pg1.remote_ip4, 53)
+        self.pg2.enable_capture()
+        self.send_peer(self.sync_msg(0, [mk(7001)]))
+        self.send_peer(self.sync_msg(5, [mk(7002)], oldest=5))
+        self.sleep(0.1)
+        acks = [h["seq"] for p, h, b in self.capture_msgs(self.pg2, ACK)]
+        self.assertIn(5, acks)
+
+    def test_duplicate_seq_not_reapplied(self):
+        """A retransmitted old SYNC doesn't resurrect a deleted session"""
+        mine, theirs = self.split()
+        f = self.vapi.cgnat_forward(in_vrf=0, in_addr=theirs[0])
+        up = record(1, theirs[0], 7003, str(f.out_addr), f.port_lo + 3, self.pg1.remote_ip4, 53)
+        dl = record(2, theirs[0], 7003, str(f.out_addr), f.port_lo + 3, self.pg1.remote_ip4, 53)
+        self.send_peer(self.sync_msg(0, [up]))
+        self.send_peer(self.sync_msg(1, [dl]))
+        self.send_peer(self.sync_msg(0, [up]))
+        self.sleep(0.1)
+        self.assertEqual(self.sessions(theirs[0]), [])
+
+    def test_fragmented_sync_applied(self):
+        """A SYNC that arrives fragmented (small pair MTU) is applied in full"""
+        mine, theirs = self.split()
+        recs = []
+        for i, h in enumerate(theirs[:4]):
+            f = self.vapi.cgnat_forward(in_vrf=0, in_addr=h)
+            for j in range(10):
+                recs.append(record(1, h, 7100 + j, str(f.out_addr), f.port_lo + j,
+                                   self.pg1.remote_ip4, 53))
+        pieces = fragment(self.sync_msg(0, recs), fragsize=400)
+        self.send_peer(pieces)
+        self.sleep(0.2)
+        self.assertEqual(sum(len(self.sessions(h)) for h in theirs[:4]), len(recs))
+
+    def test_record_overwrites_session_we_no_longer_own(self):
+        """After ownership moves, the new owner's records update our old copy"""
+        self.cluster_on(dead_interval_ms=self.dead_ms)
+        self.assertTrue(self.wait_for(lambda: self.status().ready, timeout=4))
+        for i in range(self.n_inside_hosts):  # alone: we own and create
+            self.flow(self.host(i), 7200)
+        mine, theirs = self.split()
+        h = theirs[0]
+        s0 = self.sessions(h)[0]
+        self.assertFalse(s0.warm)
+        rec = record(1, h, 7200, str(s0.out_addr), s0.out_port, self.pg1.remote_ip4, 53,
+                     to_class=2, idle_ds=7)
+        self.send_peer(self.sync_msg(0, [rec]))
+        self.sleep(0.1)
+        self.assertTrue(self.sessions(h)[0].warm)
+
     def test_dst_thread_follows_peer_workers(self):
         """Records are addressed to the peer worker that owns the subscriber there"""
         self.keep_hello(0.4, n_workers=4, first_worker=1)
@@ -746,6 +864,50 @@ class TestCgnatClusterFailover(TestCgnatClusterSync.__bases__[0]):
         self.rejoin(2.3, state=0)
         self.assertTrue(self.status().ready)
         self.assertEqual(self.capture_msgs(self.pg2, RESYNC_REQ), [])
+
+    def test_repeat_resync_req_does_not_restart_walk(self):
+        """A repeated RESYNC_REQ from the same peer epoch doesn't restart the walk"""
+        r = self.pg1.remote_ip4
+        pkts = [self.udp_in(self.host(i % 32), sport=10000 + i // 32) for i in range(3000)]
+        self.send_and_expect(self.pg0, pkts, self.pg1)
+        self.keep_hello(0.3)
+        self.pg2.enable_capture()
+        self.send_peer(self.msg(RESYNC_REQ))
+        self.sleep(0.005)
+        self.send_peer(self.msg(RESYNC_REQ))
+        self.keep_hello(0.6)
+        self.pg2.disable_capture()
+        seen = {}  # (stream, seq) -> records; retransmits are not new records
+        for p in rdpcap(self.pg2.out_path):
+            if UDP in p and p[UDP].dport == PORT:
+                h, body = parse(bytes(p[UDP].payload))
+                if h["type"] == SYNC:
+                    src, dst, recs = parse_records(body)
+                    seen[(src, dst, h["seq"])] = len(recs)
+        n = sum(seen.values())
+        self.assertGreaterEqual(n, 3000)
+        self.assertLess(n, 4500)
+
+    def test_join_is_two_phase(self):
+        """After resyncing, a joiner takes subscribers only once the peer includes it"""
+        self.rejoin(2.3)
+        self.send_peer(self.msg(RESYNC_END, END_BODY.pack(0, 1)))
+        self.keep_hello(0.4, state=READY)  # peer hasn't included us yet
+        self.assertTrue(self.status().ready)
+        self.assertEqual(self.owners(64), {2: 64})
+        self.keep_hello(0.3)  # now it has
+        self.assertEqual(set(self.owners(64)), {1, 2})
+
+    def test_steered_accepted_during_handover(self):
+        """A packet the peer steers to us during handover is translated, not bounced"""
+        mine, theirs = self.split()  # who we own in the full pair
+        self.rejoin(2.3)
+        self.send_peer(self.msg(RESYNC_END, END_BODY.pack(0, 1)))
+        self.keep_hello(0.3, state=READY)  # our active set is still {peer}
+        self.assertEqual(self.owners(64), {2: 64})
+        p = self.udp_in(mine[0], sport=5400)
+        rx = self.send_and_expect(self.pg2, [self.steer(0, p)], self.pg1, n_rx=None)
+        self.assertTrue(rx)
 
     def test_failover_uses_warm_copy(self):
         """Peer dies: its subscribers' sessions continue from our warm copies"""

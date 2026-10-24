@@ -12,6 +12,7 @@
 #define CGNAT_SYNC_RTO	       0.05 /* seconds before a retransmit */
 #define CGNAT_SYNC_TICK	       0.01 /* flush / retransmit / ack tick */
 #define CGNAT_RESYNC_SLICE     2048 /* sessions walked per thread per tick */
+#define CGNAT_SYNC_MAX_HELD    4096 /* unacked copies held per thread */
 
 /* queue a record for the peer if we own the session's subscriber */
 void cgnat_sync_session (cgnat_per_thread_t *t, u32 thread_index,

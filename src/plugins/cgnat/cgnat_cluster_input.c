@@ -24,7 +24,8 @@
   _ (BAD, "bad", "malformed or wrong version")                                \
   _ (UNKNOWN_PATH, "unknown-path", "HELLO on no configured path")             \
   _ (DUPLICATE, "duplicate-node-id", "peer uses our node id")                 \
-  _ (UNSUPPORTED, "unsupported", "message type not handled")
+  _ (UNSUPPORTED, "unsupported", "message type not handled")                  \
+  _ (BAD_SOURCE, "bad-source", "not from the pair-link peer with TTL 255")
 
 typedef enum
 {
@@ -57,26 +58,36 @@ cgnat_cluster_hello (vlib_main_t *vm, cgnat_cluster_t *cl, ip4_header_t *ip,
   cgnat_msg_hello_t *hb = (cgnat_msg_hello_t *) (h + 1);
   cgnat_path_t *p;
   f64 now = vlib_time_now (vm);
+  u16 nw, fw;
 
   if (len < sizeof (*h) + sizeof (*hb))
     return CGNAT_CLUSTER_INPUT_ERROR_BAD;
+  /* only a configured path's peer, to that path's local address, within
+     the path's hop budget, counts; everything else is ignored outright
+     (including claims to be us) */
+  if (hb->path_id >= vec_len (cl->paths))
+    return CGNAT_CLUSTER_INPUT_ERROR_UNKNOWN_PATH;
+  p = vec_elt_at_index (cl->paths, hb->path_id);
+  if (p->peer.as_u32 != ip->src_address.as_u32 ||
+      p->local.as_u32 != ip->dst_address.as_u32 || ip->ttl < p->min_ttl)
+    return CGNAT_CLUSTER_INPUT_ERROR_BAD_SOURCE;
   if (h->node_id == cl->node_id)
     {
       cl->dup_last = now;
       return CGNAT_CLUSTER_INPUT_ERROR_DUPLICATE;
     }
-  if (hb->path_id >= vec_len (cl->paths))
-    return CGNAT_CLUSTER_INPUT_ERROR_UNKNOWN_PATH;
-  p = vec_elt_at_index (cl->paths, hb->path_id);
-  if (p->peer.as_u32 != ip->src_address.as_u32)
-    return CGNAT_CLUSTER_INPUT_ERROR_UNKNOWN_PATH;
+  nw = clib_net_to_host_u16 (hb->n_workers);
+  fw = clib_net_to_host_u16 (hb->first_worker);
+  if (nw > 256 || fw > 256)
+    return CGNAT_CLUSTER_INPUT_ERROR_BAD;
 
   cl->peer_node_id = h->node_id;
   cl->peer_epoch = clib_net_to_host_u32 (h->epoch);
   cl->peer_config_hash = clib_net_to_host_u32 (h->config_hash);
   cl->peer_state = hb->state;
-  cl->peer_n_workers = clib_net_to_host_u16 (hb->n_workers);
-  cl->peer_first_worker = clib_net_to_host_u16 (hb->first_worker);
+  cl->peer_n_workers = nw;
+  cl->peer_first_worker = fw;
+  p->heard_epoch = clib_net_to_host_u32 (hb->heard_epoch);
   p->last_rx = now;
   return CGNAT_CLUSTER_INPUT_ERROR_HELLO;
 }
@@ -90,8 +101,7 @@ cgnat_cluster_steer (vlib_main_t *vm, cgnat_cluster_t *cl, vlib_buffer_t *b,
   u32 fib_index;
 
   if (len < sizeof (*h) + sizeof (*st) + sizeof (ip4_header_t) ||
-      st->direction > CGNAT_STEER_HAIRPIN ||
-      ip->src_address.as_u32 != cl->paths[0].peer.as_u32)
+      st->direction > CGNAT_STEER_HAIRPIN)
     return CGNAT_CLUSTER_INPUT_ERROR_BAD;
   fib_index = fib_table_find (FIB_PROTOCOL_IP4,
 			      clib_net_to_host_u32 (st->table_id));
@@ -139,14 +149,29 @@ VLIB_NODE_FN (cgnat_cluster_input_node)
 	e = CGNAT_CLUSTER_INPUT_ERROR_BAD;
       else if (h->type == CGNAT_MSG_HELLO)
 	e = cgnat_cluster_hello (vm, cl, ip, h, len);
+      else if (ip->ttl != CGNAT_PAIR_TTL ||
+	       ip->src_address.as_u32 != cl->paths[0].peer.as_u32 ||
+	       ip->dst_address.as_u32 != cl->paths[0].local.as_u32 ||
+	       h->node_id == cl->node_id)
+	/* everything but HELLO comes only from the pair-link peer */
+	e = CGNAT_CLUSTER_INPUT_ERROR_BAD_SOURCE;
       else if (h->type == CGNAT_MSG_STEER)
 	e = cgnat_cluster_steer (vm, cl, b, ip, h, len, &next);
-      else if (h->type == CGNAT_MSG_RESYNC_REQ &&
-	       ip->src_address.as_u32 == cl->paths[0].peer.as_u32)
+      else if (h->type == CGNAT_MSG_RESYNC_REQ)
 	{
-	  /* the peer wants our whole table: every thread walks it */
+	  /* the peer wants our whole table: every thread walks it.  A
+	     repeat from the same peer incarnation while a walk is running
+	     doesn't restart it (it would never finish on a big table) */
+	  u32 epoch = clib_net_to_host_u32 (h->epoch);
+	  f64 now = vlib_time_now (vm);
 	  cl->want_resync_peer = 0;
-	  __atomic_add_fetch (&cl->resync_walk_gen, 1, __ATOMIC_RELEASE);
+	  if (epoch != cl->resync_walk_epoch ||
+	      now - cl->resync_walk_started > 30.0)
+	    {
+	      cl->resync_walk_epoch = epoch;
+	      cl->resync_walk_started = now;
+	      __atomic_add_fetch (&cl->resync_walk_gen, 1, __ATOMIC_RELEASE);
+	    }
 	  e = CGNAT_CLUSTER_INPUT_ERROR_RESYNC;
 	}
       else if (h->type == CGNAT_MSG_RESYNC_END &&

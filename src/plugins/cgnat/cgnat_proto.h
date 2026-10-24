@@ -36,9 +36,10 @@ typedef CLIB_PACKED (struct {
   u32 seq;   /* SYNC: stream seq; ACK: highest contiguous seq */
 }) cgnat_msg_hdr_t;
 
-#define CGNAT_HELLO_READY	(1 << 0)
-#define CGNAT_HELLO_FENCED	(1 << 1)
-#define CGNAT_HELLO_WANT_RESYNC (1 << 2)
+#define CGNAT_HELLO_READY	   (1 << 0)
+#define CGNAT_HELLO_FENCED	   (1 << 1)
+#define CGNAT_HELLO_WANT_RESYNC	   (1 << 2)
+#define CGNAT_HELLO_PEER_IN_ACTIVE (1 << 3) /* my active set includes you */
 
 typedef CLIB_PACKED (struct {
   u8 path_id;
@@ -46,7 +47,11 @@ typedef CLIB_PACKED (struct {
   u16 n_workers;
   u16 first_worker;
   u16 pad;
+  u32 heard_epoch; /* the epoch I last heard from you on this path */
 }) cgnat_msg_hello_t;
+
+/* every pair message is sent with TTL 255 and checked on receipt (GTSM) */
+#define CGNAT_PAIR_TTL 255
 
 typedef enum
 {
@@ -78,6 +83,7 @@ typedef CLIB_PACKED (struct {
   u16 dst_thread;
   u16 n_records;
   u16 pad;
+  u32 oldest_unacked; /* seqs before this were given up on: skip them */
 }) cgnat_msg_sync_t;
 
 /* header flags (local use): records forwarded between our own threads */

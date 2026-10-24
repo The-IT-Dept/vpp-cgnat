@@ -112,8 +112,11 @@ sessions. Neither has per-subscriber port blocks except det44's static ones.
     link can be added later.)
 - **Config agreement.** Each node puts a hash of its maps and cluster config into every
   heartbeat and sync message.
-  - On a mismatch, both keep running on the last config they agreed on, drop "ready",
-    and say why.
+  - On a mismatch, ownership freezes at the last agreed active set, and both say why.
+    (Changed after the Phase 2 review: originally both nodes dropped "ready", which
+    with routing glue took the whole pair out of service on any rolling config change.
+    Now the serving node stays ready and raises the alarm; a node that isn't serving
+    can't join until the configs agree.)
   - Removing a map flushes its sessions. Changing a map that has live sessions is
     refused (remove and re-add instead).
 - **Subscriber identity** is (inside VRF, inside address) from day one, so maps in

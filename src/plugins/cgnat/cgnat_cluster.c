@@ -51,8 +51,8 @@ cgnat_config_hash (void)
     h = clib_xxhash (h ^ ((u64) (i + 1) << 32 | cm->timeouts[i]));
   h = clib_xxhash (h ^ (u64) cm->sessions_per_sub << 32 ^
 		   cm->inbound_sessions_per_sub);
-  h = clib_xxhash (h ^ (u64) cm->endpoint_independent_filtering << 48 ^
-		   cm->max_sessions_per_thread);
+  /* (max-sessions-per-thread is node-local sizing: not hashed) */
+  h = clib_xxhash (h ^ (u64) cm->endpoint_independent_filtering << 48);
   h = clib_xxhash (h ^ (u64) (cl->hello_interval * 1e3) << 32 ^
 		   (u64) (cl->dead_interval * 1e3));
   h = clib_xxhash (h ^ (u64) cl->refresh_interval);
@@ -83,7 +83,7 @@ cgnat_cluster_alloc (vlib_main_t *vm, u32 path, u8 type, u32 seq,
   ip = vlib_buffer_get_current (b);
   clib_memset (ip, 0, sizeof (*ip));
   ip->ip_version_and_header_length = 0x45;
-  ip->ttl = 64;
+  ip->ttl = CGNAT_PAIR_TTL;
   ip->protocol = IP_PROTOCOL_UDP;
   ip->length = clib_host_to_net_u16 (len);
   ip->src_address = p->local;
@@ -126,6 +126,15 @@ cgnat_cluster_send (vlib_main_t *vm, u32 *bis, u32 n)
     }
 }
 
+static int
+cgnat_cluster_peer_in_active (cgnat_cluster_t *cl)
+{
+  u32 w = cl->active_word, n = w & 0xff;
+  return cl->peer_node_id &&
+	 ((n >= 1 && ((w >> 8) & 0xff) == cl->peer_node_id) ||
+	  (n >= 2 && ((w >> 16) & 0xff) == cl->peer_node_id));
+}
+
 static void
 cgnat_cluster_send_hellos (vlib_main_t *vm)
 {
@@ -142,10 +151,14 @@ cgnat_cluster_send_hellos (vlib_main_t *vm)
       hb->path_id = i;
       hb->state = (cl->ready ? CGNAT_HELLO_READY : 0) |
 		  (cl->fenced ? CGNAT_HELLO_FENCED : 0) |
-		  (cl->want_resync_peer ? CGNAT_HELLO_WANT_RESYNC : 0);
+		  (cl->want_resync_peer ? CGNAT_HELLO_WANT_RESYNC : 0) |
+		  (cgnat_cluster_peer_in_active (cl) ?
+		     CGNAT_HELLO_PEER_IN_ACTIVE :
+		     0);
       hb->n_workers = clib_host_to_net_u16 (cm->n_workers);
       hb->first_worker = clib_host_to_net_u16 (cm->first_worker_index);
       hb->pad = 0;
+      hb->heard_epoch = clib_host_to_net_u32 (cl->peer_epoch);
       vec_add1 (bis, bi);
     }
   cgnat_cluster_send (vm, bis, vec_len (bis));
@@ -186,7 +199,9 @@ cgnat_cluster_evaluate (vlib_main_t *vm, f64 now)
   cl->peer_alive = 0;
   vec_foreach (p, cl->paths)
     {
-      p->alive = p->last_rx > 0 && now - p->last_rx < cl->dead_interval;
+      /* alive only both ways: we hear it, and it says it hears us */
+      p->alive = p->last_rx > 0 && now - p->last_rx < cl->dead_interval &&
+		 p->heard_epoch == cl->epoch;
       cl->peer_alive |= p->alive;
     }
   cl->pair_alive = vec_len (cl->paths) && cl->paths[0].alive;
@@ -207,11 +222,33 @@ cgnat_cluster_evaluate (vlib_main_t *vm, f64 now)
   cl->fenced = 0;
   peer_ready = !!(cl->peer_state & CGNAT_HELLO_READY);
 
-  /* every peer thread said RESYNC_END for our current request */
+  /* the same peer incarnation back after a gap (fabric flap, VM pause):
+     both of us served alone meanwhile, so the higher id gives way and
+     resyncs from the lower before taking subscribers again */
+  if (cl->peer_alive && !cl->peer_was_alive &&
+      cl->peer_epoch == cl->last_peer_epoch && cl->incumbent &&
+      cl->node_id > cl->peer_node_id && peer_ready)
+    {
+      cl->incumbent = 0;
+      cl->resync_done = 0;
+      cl->resync_end_mask = 0;
+      cl->resync_end_needed = 0;
+      cl->resync_req_sent_at = 0;
+    }
+  cl->peer_was_alive = cl->peer_alive;
+
+  /* every peer thread said RESYNC_END for our current request; we then
+     wait for the peer to include us before we take any subscribers */
   if (!cl->resync_done && cl->resync_end_needed &&
       cl->resync_epoch == cl->peer_epoch &&
       count_set_bits (cl->resync_end_mask) >= cl->resync_end_needed)
-    cl->resync_done = 1;
+    {
+      cl->resync_done = 1;
+      cl->handover_pending = 1;
+    }
+  if (cl->handover_pending &&
+      (!cl->peer_alive || (cl->peer_state & CGNAT_HELLO_PEER_IN_ACTIVE)))
+    cl->handover_pending = 0;
 
   if (dup)
     {
@@ -247,8 +284,10 @@ cgnat_cluster_evaluate (vlib_main_t *vm, f64 now)
     }
   else if (mismatch)
     {
+      /* the serving node stays in routing and raises the alarm; a node
+	 that isn't serving yet can't join until the configs agree */
       cl->reason = CGNAT_REASON_CONFIG_MISMATCH;
-      cl->ready = 0;
+      cl->ready = cl->incumbent;
     }
   else if (cl->incumbent || cl->resync_done ||
 	   (!peer_ready && cl->node_id < cl->peer_node_id))
@@ -264,7 +303,10 @@ cgnat_cluster_evaluate (vlib_main_t *vm, f64 now)
       /* joining: pull the peer's table before taking any subscribers */
       cl->reason = CGNAT_REASON_RESYNCING;
       cl->ready = 0;
-      if (peer_ready && now - cl->resync_req_sent_at >= 1.0)
+      /* (re)request only when the transfer isn't making progress */
+      if (peer_ready &&
+	  (cl->resync_req_sent_at == 0 ||
+	   now - clib_max (cl->resync_req_sent_at, cl->last_sync_rx) >= 3.0))
 	{
 	  cl->resync_epoch = cl->peer_epoch;
 	  cl->resync_end_mask = 0;
@@ -298,7 +340,7 @@ cgnat_cluster_evaluate (vlib_main_t *vm, f64 now)
 	n = 1, a = cl->peer_node_id;
       else
 	{
-	  if (cl->ready)
+	  if (cl->ready && !cl->handover_pending)
 	    a = cl->node_id, n++;
 	  if (peer_in)
 	    {
@@ -356,6 +398,9 @@ path_init (cgnat_path_t *p, ip4_address_t *local, ip4_address_t *peer,
   p->table_id = table_id;
   p->fib_index = fib_table_find_or_create_and_lock (
     FIB_PROTOCOL_IP4, table_id, cgnat_main.fib_src);
+  /* the pair link is direct; probe paths may cross one router */
+  p->min_ttl = vec_len (cgnat_main.cluster.paths) <= 1 ? CGNAT_PAIR_TTL :
+						       CGNAT_PAIR_TTL - 1;
   return 0;
 }
 
@@ -374,6 +419,12 @@ cgnat_cluster_set (int enable, u8 node_id, ip4_address_t *local,
   cgnat_cluster_t *cl = &cm->cluster;
   vlib_main_t *vm = vlib_get_main ();
   cgnat_path_t *p;
+
+  /* validate first: a refused reconfigure leaves the running cluster be */
+  if (enable &&
+      (node_id == 0 || local->as_u32 == 0 || peer->as_u32 == 0 ||
+       (dead_ms ? dead_ms : 500) <= (hello_ms ? hello_ms : 100)))
+    return VNET_API_ERROR_INVALID_VALUE;
 
   if (cl->enabled)
     {
@@ -415,6 +466,10 @@ cgnat_cluster_set (int enable, u8 node_id, ip4_address_t *local,
   cl->resync_end_mask = 0;
   cl->resync_end_needed = 0;
   cl->resync_req_sent_at = 0;
+  cl->handover_pending = 0;
+  cl->peer_was_alive = 0;
+  cl->last_sync_rx = 0;
+  cl->resync_walk_epoch = 0;
   cl->sync_gen++;
   cl->peer_alive = cl->pair_alive = cl->ready = cl->fenced = 0;
   cl->serving = 0;

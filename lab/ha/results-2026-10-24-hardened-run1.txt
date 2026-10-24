@@ -1,0 +1,16 @@
+11:49:43 kill -9 B
+11:50:03 restart B
+PASS iperf.json completed without error, 8 streams 
+PASS iperf.json throughput never zero for more than 2 s zero intervals at []
+  iperf.json Mbit/s per second: 168 160 159 159 159 159 159 159 159 159 159 159 159 164 164 159 159 159 159 159 159 159 159 159 159 159 159 167 159 159 159 159 159 159 159 159 159 159 159 159 159 168 159 159 159 159 159 159 159 159 159 159 159 165 161 158 161 159 159 159
+PASS iperf2.json completed without error, 4 streams 
+PASS iperf2.json throughput never zero for more than 2 s zero intervals at []
+  iperf2.json Mbit/s per second: 84 80 80 80 80 80 80 80 80 80 80 80 80 83 81 80 80 80 79 80 80 80 80 80 80 80 80 83 80 80 80 80 80 80 80 80 80 80 80 80 80 84 80 80 80 80 80 80 80 80 80 80 80 80 84 80 80 80 80 79
+PASS same 14 tcp connections (public ip:port) before and after before 14 after 14
+PASS every udp flow kept one public ip:port []
+PASS udp loss per flow <= 40 packets (2 s x 2 events at 10 pps) loss [7, 7, 2, 7, 3, 4, 4, 4, 4, 7, 7, 7, 4, 7, 2, 4]
+  udp max gap per flow (s): [0.6, 0.6, 0.21, 0.6, 0.2, 0.2, 0.2, 0.21, 0.2, 0.6, 0.6, 0.6, 0.21, 0.6, 0.2, 0.2]
+PASS mapping unchanged 
+PASS traffic crossed the pair link (steered-out > 0 on both before the kill) 
+PASS both nodes ready at the end 
+RESULT PASS

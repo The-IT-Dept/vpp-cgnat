@@ -51,7 +51,7 @@ cgnat_steer_send (vlib_main_t *vm, u32 *bis, u32 n, u8 direction)
 
       clib_memset (ip, 0, sizeof (*ip));
       ip->ip_version_and_header_length = 0x45;
-      ip->ttl = 64;
+      ip->ttl = CGNAT_PAIR_TTL;
       ip->protocol = IP_PROTOCOL_UDP;
       ip->length = clib_host_to_net_u16 (len);
       ip->src_address = p->local;

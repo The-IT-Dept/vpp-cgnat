@@ -9,13 +9,17 @@
 #
 # Each argument names one existing `bfd udp session` (create them in VPP's
 # startup config, followed by `... set-flags ... admin down`).
+# Readiness comes from the stats segment (/cgnat/cluster/ready), which
+# doesn't stop the workers the way a CLI command does.  The gauge is set
+# while the cluster is enabled; a node without a cluster reads not-ready.
 SOCK=${VPPCTL_SOCK:-/run/vpp/cli.sock}
 VPPCTL=${VPPCTL:-vppctl}
+STATS=${VPP_GET_STATS:-vpp_get_stats}
 state=""
 while true; do
   want=down
-  if out=$(timeout 0.5 $VPPCTL -s $SOCK show cgnat cluster 2>/dev/null) &&
-     echo "$out" | head -1 | grep -q ": ready,"; then
+  if out=$(timeout 0.5 $STATS dump /cgnat/cluster/ready 2>/dev/null) &&
+     echo "$out" | grep -q "^1"; then
     want=up
   fi
   if [ "$want" != "$state" ]; then

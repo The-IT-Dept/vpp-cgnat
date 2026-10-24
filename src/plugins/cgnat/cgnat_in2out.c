@@ -145,16 +145,26 @@ cgnat_in2out_one (vlib_main_t *vm, vlib_node_runtime_t *node, cgnat_per_thread_t
 	{
 	  if (is_steered)
 	    {
-	      b->error = node->errors[CGNAT_IN2OUT_ERROR_STEER_LOOP];
-	      return CGNAT_IN2OUT_NEXT_DROP;
+	      /* the peer steered it to us: we accept it if we own it in the
+		 full pair (a handover in flight); otherwise drop, never
+		 bounce it back */
+	      if (cgnat_owner_of (2 | cl->node_id << 8 | cl->peer_node_id << 16,
+				  map->in_table_id, ip->src_address.as_u32) != cl->node_id)
+		{
+		  b->error = node->errors[CGNAT_IN2OUT_ERROR_STEER_LOOP];
+		  return CGNAT_IN2OUT_NEXT_DROP;
+		}
 	    }
-	  if (!cl->pair_alive)
+	  else if (!cl->pair_alive)
 	    {
 	      b->error = node->errors[CGNAT_IN2OUT_ERROR_FENCED];
 	      return CGNAT_IN2OUT_NEXT_DROP;
 	    }
-	  vnet_buffer (b)->sw_if_index[VLIB_TX] = map->in_table_id;
-	  return CGNAT_NEXT_STEER;
+	  else
+	    {
+	      vnet_buffer (b)->sw_if_index[VLIB_TX] = map->in_table_id;
+	      return CGNAT_NEXT_STEER;
+	    }
 	}
       *owner = cgnat_owner_thread (map->in_table_id, ip->src_address.as_u32);
       if (PREDICT_FALSE (*owner != thread_index))

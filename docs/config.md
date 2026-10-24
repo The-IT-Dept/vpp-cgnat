@@ -6,7 +6,7 @@ The plugin is configured three ways, which all do the same things:
 - the VPP CLI
 - the binary API, for programs (`cgnat.api`)
 
-Phase 1 is a single node. Pair and cluster settings arrive with Phase 2.
+A node runs alone or as one of an active/active pair (see "The pair" below).
 
 ## startup.conf
 
@@ -171,3 +171,105 @@ Each worker expires its own sessions:
 **Cost of a session dump:** `show cgnat sessions` and `cgnat_session_dump`
 run with the workers paused and walk every session. Avoid them on a busy box.
 For a single subscriber, `cgnat_forward` and `cgnat_reverse` cost nothing.
+
+## The pair
+
+Two nodes with identical maps and policy form one CGNAT:
+
+- **Ownership:** every subscriber has one owner node, chosen by rendezvous hashing over the nodes that are live and ready.
+- **Steering:** either node may receive any packet in either direction. Packets for the peer's subscribers are steered to it over the pair link.
+- **Sync:** the owner streams every session to the peer, which keeps a warm copy.
+- **Failover:** when a node dies, the survivor already holds every session, with the same public IP and ports.
+
+### Configuration (startup.conf)
+
+```
+cgnat {
+  cluster {
+    node-id 1                              # 1..255, different on each node
+    local 10.255.124.1 peer 10.255.124.2   # the pair link (steering, sync, HELLO)
+    path local 157.20.113.243 peer 157.20.113.245   # extra liveness paths (up to 4)
+    path local 10.1.2.5 peer 10.1.2.7
+    # hello-interval 100   dead-interval 500   refresh-interval 10   port 6200
+  }
+}
+```
+
+**Configure the cluster in `startup.conf`, not in the startup CLI script.** That
+way it is on (starting) before any interface or map exists, so the node never
+translates on its own before it has joined its peer.
+
+The same settings are available via the CLI (`cgnat cluster …`, `cgnat cluster path add|del …`) and the API (`cgnat_cluster_set`, `cgnat_cluster_path_add_del`). `show cgnat cluster` and `cgnat_cluster_get_status` show the node and its peer. `cgnat_cluster_owner` tells you which node owns a subscriber.
+
+### Paths and split brain
+
+- **The pair link** carries HELLOs, steered packets and sync. Make it a dedicated, directly connected link: a VLAN between the two nodes.
+- **Extra paths** carry HELLOs only. Put them on other networks, such as each node's inside and outside links through the router, so that losing the pair link can be told apart from losing the peer.
+- A path is **alive** only in both directions: we hear the peer, and it says it hears us.
+- A node takes over the peer's subscribers only when the peer is silent on every path.
+- If the pair link is down but the peer is alive on another path, the node with the **higher id fences**: it stops translating and reports not ready. When the link returns it resyncs, then serves again.
+
+### Ready, and what routing should watch
+
+`/cgnat/cluster/ready` (stats gauge) and `ready` in the status API mean the node
+should receive traffic. Route to a node only while it is ready. Example glue:
+static routes on the router with BFD-checked next hops, and
+`contrib/cgnat-ready-bfd.sh` on each node keeping its BFD sessions admin-up only
+while ready.
+
+| reason | ready | meaning |
+|---|---|---|
+| `starting` | no | First dead interval after the pair-link address exists. Can't hear the peer yet. |
+| `unconfigured` | no | No maps: nothing to translate. |
+| `alone` | yes | Peer silent on every path. This node owns everyone. |
+| `none` | yes | Pair up, owners split. |
+| `resyncing` | no | Joining a ready peer. Pulls its whole table, then waits for the peer to include it (two-phase) before taking subscribers. |
+| `fenced` | no | Pair link down, peer alive elsewhere, higher id. |
+| `config-mismatch` | as before | Maps or policy differ from the peer. The serving node stays ready and raises this alarm. Ownership is frozen and a node that isn't serving can't join until the configs agree. |
+| `duplicate-node-id` | no | The peer uses our node id. |
+
+A node that is already serving stays the incumbent: a joining or restarting peer
+resyncs from it. If the same peer incarnation comes back after a gap, the higher
+id resyncs from the lower.
+
+### Pair-link MTU
+
+Steered packets are encapsulated with 56 bytes of headers. Give the pair link an
+MTU of at least 1600 (jumbo is better) so full-size packets aren't fragmented.
+Fragmented steered packets do work, but each one costs a full reassembly at
+the owner. SYNC packets are up to 1360 bytes.
+
+### Security
+
+The pair protocol is UDP 6200. A node accepts:
+
+- HELLOs only from a configured path's peer, to that path's local address, with TTL 255 on the pair link (254 on extra paths, which may cross one router).
+- Everything else (steer, sync, ack, resync) only from the pair-link peer with TTL 255.
+- Sync records only if their public IP:port lies in the subscriber's block by the formula.
+
+**On the router, drop UDP 6200 towards the nodes' inside and outside addresses
+from anywhere except the nodes themselves.**
+
+### Wire protocol (v1)
+
+Network byte order. Every message starts with a 16-byte header:
+`version, type, flags, node_id, config_hash, epoch, seq`.
+
+| type | body |
+|---|---|
+| 1 HELLO | path_id, state (ready, fenced, want_resync, peer_in_active), n_workers, first_worker, heard_epoch |
+| 2 STEER | direction (in2out, out2in, hairpin), reassembly flags, tcp flags or icmp type, table_id, l4 ports; then the original IPv4 packet |
+| 3 SYNC | src_thread, dst_thread, n_records, oldest_unacked; then 32-byte records (op, proto, tcp state, timeout class, inside table, inside ip:port, outside ip:port, remote ip:port, idle) |
+| 4 ACK | src_thread, dst_thread; header seq = highest in-order seq received |
+| 5 RESYNC_REQ | none |
+| 6 RESYNC_END | src_thread, n_src_threads |
+
+`cgnat_proto.h` is the reference.
+
+### Sync behaviour
+
+- **What is sent:** records go out on session create, on a timeout-class change, at most every `refresh-interval` while a session is active, and on delete.
+- **Streams:** one per (local worker, peer worker), batched up to 40 records. They are sequenced and applied strictly in order, with a cumulative ACK and go-back-N retransmit after 50 ms.
+- **Falling behind:** a stream more than `window` packets behind (default 1024), or a thread holding 4096 unacked packets, gives up the oldest and asks the peer to pull a full resync.
+- **Warm copies:** these expire `refresh-interval` after the session's own timeout.
+- **Who wins:** an owner never takes state from its peer for a live session it owns. A copy of a session whose subscriber has moved to the peer takes the peer's records.

@@ -37,7 +37,8 @@ tx_stream (cgnat_per_thread_t *t, u32 dst)
 }
 
 static void
-tx_flush (vlib_main_t *vm, cgnat_sync_tx_t *st, f64 now)
+tx_flush (vlib_main_t *vm, cgnat_per_thread_t *t, cgnat_sync_tx_t *st,
+	  f64 now)
 {
   cgnat_main_t *cm = &cgnat_main;
   cgnat_cluster_t *cl = &cm->cluster;
@@ -61,6 +62,19 @@ tx_flush (vlib_main_t *vm, cgnat_sync_tx_t *st, f64 now)
   udp->length = clib_host_to_net_u16 (b->current_length - sizeof (*ip));
   sb->n_records = clib_host_to_net_u16 (st->n_records);
 
+  /* too far behind (per stream, or copies held on this thread): give up
+     on the oldest, ask the peer for a full resync instead */
+  while (vec_len (st->unacked) &&
+	 (vec_len (st->unacked) >= cl->window ||
+	  t->sync_held >= CGNAT_SYNC_MAX_HELD))
+    {
+      vlib_buffer_free_one (vm, st->unacked[0].bi);
+      vec_delete (st->unacked, 1, 0);
+      t->sync_held--;
+      cl->want_resync_peer = 1;
+      vlib_increment_simple_counter (
+	&cm->counters[CGNAT_COUNTER_SYNC_OVERFLOW], vm->thread_index, 0, 1);
+    }
   copy = vlib_buffer_copy (vm, b);
   if (copy)
     {
@@ -68,16 +82,18 @@ tx_flush (vlib_main_t *vm, cgnat_sync_tx_t *st, f64 now)
       pe->seq = clib_net_to_host_u32 (h->seq);
       pe->bi = vlib_get_buffer_index (vm, copy);
       pe->sent = now;
-      if (vec_len (st->unacked) > cl->window)
-	{
-	  /* too far behind: drop the oldest, ask for a full resync */
-	  vlib_buffer_free_one (vm, st->unacked[0].bi);
-	  vec_delete (st->unacked, 1, 0);
-	  cl->want_resync_peer = 1;
-	  vlib_increment_simple_counter (
-	    &cm->counters[CGNAT_COUNTER_SYNC_OVERFLOW], vm->thread_index, 0,
-	    1);
-	}
+      t->sync_held++;
+    }
+  else
+    cl->want_resync_peer = 1; /* can't retransmit it: the peer will skip it */
+  /* the receiver may step over anything older than this */
+  sb->oldest_unacked = clib_host_to_net_u32 (
+    vec_len (st->unacked) ? st->unacked[0].seq : clib_net_to_host_u32 (h->seq));
+  if (copy)
+    {
+      cgnat_msg_sync_t *csb = (cgnat_msg_sync_t *) ((u8 *) vlib_buffer_get_current (copy) +
+					      ((u8 *) sb - (u8 *) ip));
+      csb->oldest_unacked = sb->oldest_unacked;
     }
   cgnat_cluster_send (vm, &st->bi, 1);
   st->bi = ~0;
@@ -135,7 +151,7 @@ sync_session (cgnat_per_thread_t *t, u32 thread_index, cgnat_session_t *s,
   st = tx_stream (t, dst);
   if (st->bi == ~0)
     {
-      cgnat_msg_sync_t *sb;
+      cgnat_msg_sync_t *sb; /* oldest_unacked is filled at flush */
       if (!cgnat_cluster_alloc (vm, 0, CGNAT_MSG_SYNC, st->next_seq++,
 				sizeof (*sb), (void **) &sb, &st->bi))
 	{
@@ -146,6 +162,7 @@ sync_session (cgnat_per_thread_t *t, u32 thread_index, cgnat_session_t *s,
       sb->dst_thread = clib_host_to_net_u16 (dst);
       sb->n_records = 0;
       sb->pad = 0;
+      sb->oldest_unacked = 0;
     }
   b = vlib_get_buffer (vm, st->bi);
   r = vlib_buffer_get_current (b) + b->current_length;
@@ -168,7 +185,7 @@ sync_session (cgnat_per_thread_t *t, u32 thread_index, cgnat_session_t *s,
   vlib_increment_simple_counter (
     &cm->counters[CGNAT_COUNTER_SYNC_RECORDS_OUT], thread_index, 0, 1);
   if (++st->n_records >= CGNAT_SYNC_MAX_RECORDS)
-    tx_flush (vm, st, now);
+    tx_flush (vm, t, st, now);
 }
 
 static void
@@ -184,6 +201,7 @@ streams_reset (vlib_main_t *vm, cgnat_per_thread_t *t)
       vec_foreach (pe, st->unacked)
 	vlib_buffer_free_one (vm, pe->bi);
       vec_free (st->unacked);
+      t->sync_held = 0;
       st->bi = ~0;
       st->n_records = 0;
       st->next_seq = 0;
@@ -202,6 +220,7 @@ streams_reset (vlib_main_t *vm, cgnat_per_thread_t *t)
   _ (CONFLICT, "sync-conflict", "record's outside port held by another flow")\
   _ (TABLE_FULL, "sync-table-full", "no room for a synced session")           \
   _ (OWNED, "sync-owned", "record for a session we own (kept ours)")          \
+  _ (BAD_RECORD, "sync-bad-record", "record's public ip:port not the subscriber's block") \
   _ (FORWARDED, "sync-forwarded", "records forwarded to the owning thread")  \
   _ (BAD, "bad", "malformed sync/ack")
 
@@ -229,6 +248,7 @@ apply_record (vlib_main_t *vm, cgnat_per_thread_t *t, u32 ti,
   cgnat_map_t *map = 0;
   cgnat_sub_t *sub;
   u32 fib_index;
+  int mine;
 
   fib_index = fib_table_find (FIB_PROTOCOL_IP4,
 			      clib_net_to_host_u32 (r->in_table_id));
@@ -236,6 +256,19 @@ apply_record (vlib_main_t *vm, cgnat_per_thread_t *t, u32 ti,
     map = cgnat_map_by_inside (fib_index, &in);
   if (!map || r->proto >= CGNAT_N_PROTO || r->to_class >= CGNAT_N_TO)
     return CGNAT_SYNC_WORKER_ERROR_UNKNOWN_MAP;
+
+  /* the public side must be exactly what the formula gives this
+     subscriber: no record may claim another subscriber's ip:port */
+  {
+    ip4_address_t fout;
+    u16 lo, hi, op = clib_net_to_host_u16 (r->out_port);
+    cgnat_forward (map, &in, &fout, &lo, &hi);
+    if (fout.as_u32 != out.as_u32 || op < lo || op > hi)
+      return CGNAT_SYNC_WORKER_ERROR_BAD_RECORD;
+  }
+  /* a copy of ours that we no longer own (ownership moved) or that has
+     expired belongs to the new owner's records */
+  mine = cgnat_owner_node (map->in_table_id, in.as_u32) == cgnat_main.cluster.node_id;
 
   m = cgnat_mapping_find (t, 0, map->in_fib_index, in.as_u32, r->in_port,
 			  r->proto);
@@ -245,7 +278,7 @@ apply_record (vlib_main_t *vm, cgnat_per_thread_t *t, u32 ti,
       if (m &&
 	  (s = cgnat_session_find (t, m - t->mappings, r->remote_addr,
 				   r->remote_port)) &&
-	  s->warm)
+	  (s->warm || !mine))
 	cgnat_session_free (t, ti, s);
       return CGNAT_SYNC_WORKER_ERROR_RECORDS;
     }
@@ -277,7 +310,7 @@ apply_record (vlib_main_t *vm, cgnat_per_thread_t *t, u32 ti,
 				r->to_class, now,
 				clib_net_to_host_u32 (r->pad) & 1);
     }
-  else if (!s->warm)
+  else if (!s->warm && mine && !cgnat_session_expired (s, now))
     return CGNAT_SYNC_WORKER_ERROR_OWNED; /* we own it: keep our state */
   s->tcp_state = r->tcp_state;
   cgnat_session_relink (t, s, r->to_class,
@@ -348,8 +381,14 @@ VLIB_NODE_FN (cgnat_sync_worker_node)
   for (i = 0; i < n; i++)
     {
       vlib_buffer_t *b = vlib_get_buffer (vm, from[i]);
-      cgnat_msg_hdr_t *h = vlib_buffer_get_current (b);
-      u32 len = b->current_length;
+      cgnat_msg_hdr_t *h;
+      u32 len;
+
+      /* a SYNC that was fragmented arrives as a buffer chain */
+      if (b->flags & VLIB_BUFFER_NEXT_PRESENT)
+	vlib_buffer_chain_linearize (vm, b);
+      h = vlib_buffer_get_current (b);
+      len = b->current_length;
 
       if (h->type == CGNAT_MSG_SYNC && len >= sizeof (*h) + sizeof (cgnat_msg_sync_t))
 	{
@@ -371,6 +410,9 @@ VLIB_NODE_FN (cgnat_sync_worker_node)
 	    }
 	  if (!(h->flags & CGNAT_MSG_F_FORWARDED))
 	    {
+	      u32 oldest = clib_net_to_host_u32 (sb->oldest_unacked);
+	      int in_order;
+
 	      vec_validate (t->sync_rx, src);
 	      rx = vec_elt_at_index (t->sync_rx, src);
 	      if (rx->epoch != epoch)
@@ -378,9 +420,17 @@ VLIB_NODE_FN (cgnat_sync_worker_node)
 		  rx->epoch = epoch;
 		  rx->expected = 0;
 		}
-	      if (seq == rx->expected)
-		rx->expected++;
+	      /* the sender gave up on everything before oldest */
+	      if ((i32) (oldest - rx->expected) > 0)
+		rx->expected = oldest;
 	      rx->ack_pending = 1;
+	      /* strictly in order: an old retransmit or a packet after a gap
+		 is not applied (go-back-N resends it in order) */
+	      in_order = seq == rx->expected;
+	      if (!in_order)
+		continue;
+	      rx->expected++;
+	      cgnat_main.cluster.last_sync_rx = now;
 	    }
 	  for (k = 0; k < nr; k++)
 	    {
@@ -409,8 +459,9 @@ VLIB_NODE_FN (cgnat_sync_worker_node)
 		vec_free (strays[x]);
 	      vec_free (strays);
 	    }
-	  vlib_increment_simple_counter (
-	    &cm->counters[CGNAT_COUNTER_SYNC_RECORDS_IN], ti, 0, nr);
+	  if (!(h->flags & CGNAT_MSG_F_FORWARDED))
+	    vlib_increment_simple_counter (
+	      &cm->counters[CGNAT_COUNTER_SYNC_RECORDS_IN], ti, 0, nr);
 	}
       else if (h->type == CGNAT_MSG_ACK && len >= sizeof (*h) + sizeof (cgnat_msg_ack_t))
 	{
@@ -422,14 +473,18 @@ VLIB_NODE_FN (cgnat_sync_worker_node)
 
 	  vlib_node_increment_counter (vm, node->node_index,
 				       CGNAT_SYNC_WORKER_ERROR_ACKS, 1);
-	  if (dst >= vec_len (t->sync_tx))
+	  if (dst >= vec_len (t->sync_tx) ||
+	      clib_net_to_host_u32 (h->epoch) != cm->cluster.peer_epoch)
 	    continue;
 	  st = vec_elt_at_index (t->sync_tx, dst);
 	  while (k < vec_len (st->unacked) &&
 		 (i32) (st->unacked[k].seq - acked) <= 0)
 	    vlib_buffer_free_one (vm, st->unacked[k++].bi);
 	  if (k)
-	    vec_delete (st->unacked, k, 0);
+	    {
+	      vec_delete (st->unacked, k, 0);
+	      t->sync_held -= k;
+	    }
 	}
       else
 	vlib_node_increment_counter (vm, node->node_index,
@@ -489,7 +544,7 @@ VLIB_NODE_FN (cgnat_sync_flush_node)
     {
       cgnat_sync_pending_t *pe;
 
-      tx_flush (vm, st, now);
+      tx_flush (vm, t, st, now);
       if (!cl->pair_alive)
 	continue;
       vec_foreach (pe, st->unacked)
@@ -547,7 +602,7 @@ VLIB_NODE_FN (cgnat_sync_flush_node)
 	  u32 bi;
 
 	  vec_foreach (st, t->sync_tx)
-	    tx_flush (vm, st, now);
+	    tx_flush (vm, t, st, now);
 	  if (cgnat_cluster_alloc (vm, 0, CGNAT_MSG_RESYNC_END, 0,
 				   sizeof (*eb), (void **) &eb, &bi))
 	    {

@@ -4,10 +4,11 @@ A carrier-grade NAT plugin for [VPP](https://fd.io), built around
 **deterministic port blocks**. The goal is an **active/active HA pair** on
 commodity servers.
 
-> **Status: Phase 1 of 2 — single node.** Translation, policy, multi-worker
-> handoff, configuration and observability are done and tested. The HA pair
-> is Phase 2: peer liveness, ownership, steering between nodes, session sync,
-> failover and failback. See [the design](docs/superpowers/specs/2026-10-24-cgnat-ha-design.md).
+> **Status:** the single node (Phase 1) and the active/active pair (Phase 2) are
+> done and tested in VPP's `make test` (165 tests) and in a two-VPP lab with real
+> TCP/UDP flows and kill/restore. Production proof on two VMs is next. See
+> [the design](docs/superpowers/specs/2026-10-24-cgnat-ha-design.md) and
+> [configuration](docs/config.md).
 
 ## Why
 
@@ -72,9 +73,41 @@ vpp# show cgnat lookup reverse 157.20.113.160:11104
 157.20.113.160:11104 vrf 0 -> 100.64.0.5 vrf 0
 ```
 
-## Performance (Phase 1, single node)
+## The pair
 
-NUMBERS_PLACEHOLDER
+Two nodes, both translating.
+
+- **Who serves whom:** each subscriber has one owner node (rendezvous hashing over the live, ready nodes). A packet that lands on the other node is steered to the owner over a dedicated pair link, so the router can hash both directions however it likes.
+- **Sync:** owners stream every session to the peer, batched, sequenced, acknowledged and retransmitted, with full resync. The peer holds warm copies.
+- **Failover:** when a node dies, the survivor already holds everything. Established sessions continue with the same public IP and port.
+- **Failback:** a returning node pulls the whole table, then takes its subscribers back in two phases.
+- **Split brain:** liveness runs on several paths. If only the pair link fails, the higher id fences.
+- **Readiness:** the plugin exposes "ready" for the operator's routing to watch. `contrib/cgnat-ready-bfd.sh` keeps BFD up only while ready. The plugin itself does no routing.
+
+**Two-VPP lab** ([lab/ha](lab/ha/README.md)): a router namespace load-shares
+both directions across both nodes. 12 TCP streams and 16 UDP flows run while
+node B is killed with `kill -9` at 15 s and restarted at 35 s:
+
+| | result |
+|---|---|
+| without the pair (two independent nodes) | FAIL: UDP flows lose everything, TCP connections fail |
+| with the pair | PASS (repeatable): 14/14 TCP connections kept with the same public IP:port, no throughput dip at kill or restore, UDP worst gap per flow 0.6 s (failure detection + route change) |
+
+## Performance (single node, packet generator)
+
+Release build on an 8-vCPU VM on a busy shared host, VPP's packet generator,
+64-byte UDP. These numbers are a floor, not a ceiling. The generator shares
+each worker's core, and at about 1.5 Mpps per worker it is the bottleneck.
+
+| | 1 worker |
+|---|---|
+| new sessions | 160–380k sessions/s (varies run to run on this host) |
+| established flows, 15k flows | 1.54 Mpps (generator-bound); cgnat node 723 clocks/pkt |
+| established flows, 1M flows | 1.45 Mpps; cgnat node 1350 clocks/pkt |
+| memory | about 215 bytes per session |
+
+Proper numbers on dedicated cores with DPDK NICs and a real traffic generator
+are still to do. Raw results are in `bench/`.
 
 ## Building and testing
 

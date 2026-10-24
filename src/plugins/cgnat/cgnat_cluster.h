@@ -18,6 +18,8 @@ typedef struct
   u32 table_id;
   u32 fib_index;
   f64 last_rx;
+  u32 heard_epoch; /* what the peer last said it heard from us */
+  u8 min_ttl;	   /* 255 on the pair link; probe paths may cross a router */
   u8 alive;
 } cgnat_path_t;
 
@@ -70,6 +72,14 @@ typedef struct
   u8 fenced;
   u8 serving; /* data path may translate (owner checks come on top) */
   u32 active_word; /* active node set, see cgnat_owner.h */
+
+  /* two-phase join: resynced, waiting for the peer to include us */
+  u8 handover_pending;
+  u8 peer_was_alive;
+  volatile f64 last_sync_rx; /* last records received (resync progress) */
+  /* the walk serving the peer's resync request */
+  u32 resync_walk_epoch;
+  f64 resync_walk_started;
 
   /* sync */
   u32 window;		   /* unacked SYNCs kept per stream */

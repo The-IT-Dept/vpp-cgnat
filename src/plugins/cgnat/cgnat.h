@@ -147,6 +147,7 @@ typedef struct
   cgnat_sync_tx_t *sync_tx; /* by peer thread */
   cgnat_sync_rx_t *sync_rx; /* by peer thread */
   u32 sync_gen;
+  u32 sync_held; /* unacked copies held, all streams */
   u32 resync_walk_gen; /* last walk started */
   u32 resync_cursor;   /* next session pool index */
   u8 resync_active;
