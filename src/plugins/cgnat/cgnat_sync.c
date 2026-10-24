@@ -84,9 +84,26 @@ tx_flush (vlib_main_t *vm, cgnat_sync_tx_t *st, f64 now)
   st->n_records = 0;
 }
 
+static void sync_session (cgnat_per_thread_t *t, u32 thread_index,
+			  cgnat_session_t *s, u8 op, int any);
+
 void
 cgnat_sync_session (cgnat_per_thread_t *t, u32 thread_index,
 		    cgnat_session_t *s, u8 op)
+{
+  sync_session (t, thread_index, s, op, 0);
+}
+
+void
+cgnat_sync_session_any (cgnat_per_thread_t *t, u32 thread_index,
+			cgnat_session_t *s, u8 op)
+{
+  sync_session (t, thread_index, s, op, 1);
+}
+
+static void
+sync_session (cgnat_per_thread_t *t, u32 thread_index, cgnat_session_t *s,
+	      u8 op, int any)
 {
   cgnat_main_t *cm = &cgnat_main;
   cgnat_cluster_t *cl = &cm->cluster;
@@ -107,7 +124,8 @@ cgnat_sync_session (cgnat_per_thread_t *t, u32 thread_index,
     return;
   m = pool_elt_at_index (t->mappings, s->mapping_index);
   map = pool_elt_at_index (cm->maps, m->map_index);
-  if (cgnat_owner_node (map->in_table_id, m->in_addr.as_u32) != cl->node_id)
+  if (!any &&
+      cgnat_owner_node (map->in_table_id, m->in_addr.as_u32) != cl->node_id)
     return;
 
   vm = vlib_get_main ();
@@ -183,6 +201,8 @@ streams_reset (vlib_main_t *vm, cgnat_per_thread_t *t)
   _ (UNKNOWN_MAP, "sync-unknown-map", "record for a map we don't have")       \
   _ (CONFLICT, "sync-conflict", "record's outside port held by another flow")\
   _ (TABLE_FULL, "sync-table-full", "no room for a synced session")           \
+  _ (OWNED, "sync-owned", "record for a session we own (kept ours)")          \
+  _ (FORWARDED, "sync-forwarded", "records forwarded to the owning thread")  \
   _ (BAD, "bad", "malformed sync/ack")
 
 typedef enum
@@ -221,8 +241,11 @@ apply_record (vlib_main_t *vm, cgnat_per_thread_t *t, u32 ti,
 			  r->proto);
   if (r->op == CGNAT_REC_DELETE)
     {
-      if (m && (s = cgnat_session_find (t, m - t->mappings, r->remote_addr,
-					 r->remote_port)))
+      /* a live session of ours is ours to end, not the peer's */
+      if (m &&
+	  (s = cgnat_session_find (t, m - t->mappings, r->remote_addr,
+				   r->remote_port)) &&
+	  s->warm)
 	cgnat_session_free (t, ti, s);
       return CGNAT_SYNC_WORKER_ERROR_RECORDS;
     }
@@ -254,12 +277,63 @@ apply_record (vlib_main_t *vm, cgnat_per_thread_t *t, u32 ti,
 				r->to_class, now,
 				clib_net_to_host_u32 (r->pad) & 1);
     }
+  else if (!s->warm)
+    return CGNAT_SYNC_WORKER_ERROR_OWNED; /* we own it: keep our state */
   s->tcp_state = r->tcp_state;
   cgnat_session_touch (t, s, r->to_class,
 		       now - clib_net_to_host_u16 (r->idle_ds) / 10.0);
   s->warm = 1;
   s->last_synced = now;
   return CGNAT_SYNC_WORKER_ERROR_RECORDS;
+}
+
+/*
+ * Records whose subscriber another local thread owns (the sender's view
+ * of our workers was stale) are copied into a forwarded SYNC and handed to
+ * that thread.  Forwarded SYNCs don't touch stream state or acks.
+ */
+static void
+forward_records (vlib_main_t *vm, vlib_node_runtime_t *node,
+		 cgnat_msg_hdr_t *h,
+		 cgnat_sync_record_t **by_thread, u32 n_threads)
+{
+  u32 bis[64], tis[64], n = 0, ti;
+  u16 tis16[64];
+
+  for (ti = 0; ti < n_threads && n < 64; ti++)
+    {
+      cgnat_sync_record_t *recs = by_thread[ti];
+      vlib_buffer_t *b;
+      cgnat_msg_hdr_t *fh;
+      cgnat_msg_sync_t *sb;
+      u32 bi, bytes;
+
+      if (!vec_len (recs))
+	continue;
+      bytes = sizeof (*fh) + sizeof (*sb) + vec_len (recs) * sizeof (*recs);
+      if (vlib_buffer_alloc (vm, &bi, 1) != 1)
+	continue;
+      b = vlib_get_buffer (vm, bi);
+      b->current_data = 0;
+      b->current_length = bytes;
+      fh = vlib_buffer_get_current (b);
+      *fh = *h;
+      fh->flags |= CGNAT_MSG_F_FORWARDED;
+      sb = (cgnat_msg_sync_t *) (fh + 1);
+      sb->src_thread = 0;
+      sb->dst_thread = clib_host_to_net_u16 (ti);
+      sb->n_records = clib_host_to_net_u16 (vec_len (recs));
+      sb->pad = 0;
+      clib_memcpy_fast (sb + 1, recs, vec_len (recs) * sizeof (*recs));
+      bis[n] = bi;
+      tis[n] = ti;
+      n++;
+    }
+  for (ti = 0; ti < n; ti++)
+    tis16[ti] = tis[ti];
+  if (n)
+    vlib_buffer_enqueue_to_thread (vm, node, cgnat_main.fq_sync_index, bis,
+				   tis16, n, 1);
 }
 
 VLIB_NODE_FN (cgnat_sync_worker_node)
@@ -286,6 +360,8 @@ VLIB_NODE_FN (cgnat_sync_worker_node)
 	  u32 seq = clib_net_to_host_u32 (h->seq);
 	  u32 epoch = clib_net_to_host_u32 (h->epoch);
 	  cgnat_sync_rx_t *rx;
+	  cgnat_sync_record_t **strays = 0;
+	  int n_strays = 0;
 
 	  if (len < sizeof (*h) + sizeof (*sb) + nr * sizeof (*r) || src > 1024)
 	    {
@@ -293,20 +369,46 @@ VLIB_NODE_FN (cgnat_sync_worker_node)
 					   CGNAT_SYNC_WORKER_ERROR_BAD, 1);
 	      continue;
 	    }
-	  vec_validate (t->sync_rx, src);
-	  rx = vec_elt_at_index (t->sync_rx, src);
-	  if (rx->epoch != epoch)
+	  if (!(h->flags & CGNAT_MSG_F_FORWARDED))
 	    {
-	      rx->epoch = epoch;
-	      rx->expected = 0;
+	      vec_validate (t->sync_rx, src);
+	      rx = vec_elt_at_index (t->sync_rx, src);
+	      if (rx->epoch != epoch)
+		{
+		  rx->epoch = epoch;
+		  rx->expected = 0;
+		}
+	      if (seq == rx->expected)
+		rx->expected++;
+	      rx->ack_pending = 1;
 	    }
-	  if (seq == rx->expected)
-	    rx->expected++;
-	  rx->ack_pending = 1;
 	  for (k = 0; k < nr; k++)
-	    vlib_node_increment_counter (vm, node->node_index,
-					 apply_record (vm, t, ti, r + k, now),
-					 1);
+	    {
+	      u32 owner = cgnat_thread_for (
+		clib_net_to_host_u32 (r[k].in_table_id), r[k].in_addr,
+		cm->first_worker_index, cm->n_workers);
+	      if (owner != ti)
+		{
+		  vec_validate (strays, vlib_get_n_threads () - 1);
+		  vec_add1 (strays[owner], r[k]);
+		  n_strays++;
+		  continue;
+		}
+	      vlib_node_increment_counter (vm, node->node_index,
+					   apply_record (vm, t, ti, r + k, now),
+					   1);
+	    }
+	  if (n_strays)
+	    {
+	      u32 x;
+	      forward_records (vm, node, h, strays, vec_len (strays));
+	      vlib_node_increment_counter (vm, node->node_index,
+					   CGNAT_SYNC_WORKER_ERROR_FORWARDED,
+					   n_strays);
+	      vec_foreach_index (x, strays)
+		vec_free (strays[x]);
+	      vec_free (strays);
+	    }
 	  vlib_increment_simple_counter (
 	    &cm->counters[CGNAT_COUNTER_SYNC_RECORDS_IN], ti, 0, nr);
 	}
@@ -413,6 +515,48 @@ VLIB_NODE_FN (cgnat_sync_flush_node)
 	continue;
       send_ack (vm, rx - t->sync_rx, ti, rx->expected - 1);
       rx->ack_pending = 0;
+    }
+
+  /* the peer asked for our whole table: walk it in slices */
+  if (t->resync_walk_gen !=
+      __atomic_load_n (&cl->resync_walk_gen, __ATOMIC_ACQUIRE))
+    {
+      t->resync_walk_gen = cl->resync_walk_gen;
+      t->resync_cursor = 0;
+      t->resync_active = 1;
+    }
+  if (t->resync_active)
+    {
+      u32 n = 0, end = vec_len (t->sessions_pool);
+
+      if (!cl->peer_alive || !cl->pair_alive)
+	t->resync_active = 0;
+      while (t->resync_active && t->resync_cursor < end &&
+	     n < CGNAT_RESYNC_SLICE)
+	{
+	  u32 i = t->resync_cursor++;
+	  if (pool_is_free_index (t->sessions_pool, i))
+	    continue;
+	  cgnat_sync_session_any (t, ti, pool_elt_at_index (t->sessions_pool, i),
+				  CGNAT_REC_UPSERT);
+	  n++;
+	}
+      if (t->resync_active && t->resync_cursor >= end)
+	{
+	  cgnat_msg_resync_end_t *eb;
+	  u32 bi;
+
+	  vec_foreach (st, t->sync_tx)
+	    tx_flush (vm, st, now);
+	  if (cgnat_cluster_alloc (vm, 0, CGNAT_MSG_RESYNC_END, 0,
+				   sizeof (*eb), (void **) &eb, &bi))
+	    {
+	      eb->src_thread = clib_host_to_net_u16 (ti);
+	      eb->n_src_threads = clib_host_to_net_u16 (vlib_get_n_threads ());
+	      cgnat_cluster_send (vm, &bi, 1);
+	    }
+	  t->resync_active = 0;
+	}
     }
   return 0;
 }

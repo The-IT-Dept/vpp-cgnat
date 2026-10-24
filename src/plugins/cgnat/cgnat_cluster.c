@@ -151,21 +151,36 @@ cgnat_cluster_send_hellos (vlib_main_t *vm)
   vec_free (bis);
 }
 
+static void
+cgnat_cluster_send_resync_req (vlib_main_t *vm)
+{
+  void *body;
+  u32 bi;
+
+  if (cgnat_cluster_alloc (vm, 0, CGNAT_MSG_RESYNC_REQ, 0, 0, &body, &bi))
+    cgnat_cluster_send (vm, &bi, 1);
+}
+
 /* evaluate liveness and readiness; runs on main each hello interval */
 static void
 cgnat_cluster_evaluate (vlib_main_t *vm, f64 now)
 {
   cgnat_cluster_t *cl = &cgnat_main.cluster;
   cgnat_path_t *p;
-  int starting, dup, mismatch, fence, peer_in;
+  int starting, dup, mismatch, fence, peer_in, peer_ready;
   u32 n = 0, a = 0, b = 0;
 
   cl->config_hash = cgnat_config_hash ();
   if (cl->peer_epoch && cl->peer_epoch != cl->last_peer_epoch)
     {
-      /* a new peer incarnation: reset sync streams on every thread */
+      /* a new peer incarnation: reset sync streams on every thread; a
+	 resync we were pulling from the old one starts again */
       cl->last_peer_epoch = cl->peer_epoch;
       cl->sync_gen++;
+      cl->resync_done = 0;
+      cl->resync_end_mask = 0;
+      cl->resync_end_needed = 0;
+      cl->resync_req_sent_at = 0;
     }
   cl->peer_alive = 0;
   vec_foreach (p, cl->paths)
@@ -183,6 +198,13 @@ cgnat_cluster_evaluate (vlib_main_t *vm, f64 now)
      alive elsewhere -> the higher id stands down */
   fence = !cl->pair_alive && cl->peer_alive && cl->node_id > cl->peer_node_id;
   cl->fenced = 0;
+  peer_ready = !!(cl->peer_state & CGNAT_HELLO_READY);
+
+  /* every peer thread said RESYNC_END for our current request */
+  if (!cl->resync_done && cl->resync_end_needed &&
+      cl->resync_epoch == cl->peer_epoch &&
+      count_set_bits (cl->resync_end_mask) >= cl->resync_end_needed)
+    cl->resync_done = 1;
 
   if (dup)
     {
@@ -199,21 +221,52 @@ cgnat_cluster_evaluate (vlib_main_t *vm, f64 now)
       cl->reason = CGNAT_REASON_FENCED;
       cl->ready = 0;
       cl->fenced = 1;
+      /* when the link returns we resync before serving again */
+      cl->incumbent = 0;
+      cl->resync_done = 0;
     }
   else if (!cl->peer_alive)
     {
       cl->reason = CGNAT_REASON_ALONE;
       cl->ready = 1;
+      cl->incumbent = 1;
     }
   else if (mismatch)
     {
       cl->reason = CGNAT_REASON_CONFIG_MISMATCH;
       cl->ready = 0;
     }
-  else
+  else if (cl->incumbent || cl->resync_done ||
+	   (!peer_ready && cl->node_id < cl->peer_node_id))
     {
+      /* serving already, or just pulled the peer's table, or both of us
+	 are starting and the lower id goes first */
       cl->reason = CGNAT_REASON_NONE;
       cl->ready = 1;
+      cl->incumbent = 1;
+    }
+  else
+    {
+      /* joining: pull the peer's table before taking any subscribers */
+      cl->reason = CGNAT_REASON_RESYNCING;
+      cl->ready = 0;
+      if (peer_ready && now - cl->resync_req_sent_at >= 1.0)
+	{
+	  cl->resync_epoch = cl->peer_epoch;
+	  cl->resync_end_mask = 0;
+	  cl->resync_end_needed = 0;
+	  cgnat_cluster_send_resync_req (vm);
+	  cl->resync_req_sent_at = now;
+	}
+    }
+
+  /* the peer lost some of our stream: ask it to send us everything */
+  if (cl->ready && cl->peer_alive && cl->pair_alive &&
+      (cl->peer_state & CGNAT_HELLO_WANT_RESYNC) &&
+      now - cl->resync_req_sent_at >= 1.0)
+    {
+      cgnat_cluster_send_resync_req (vm);
+      cl->resync_req_sent_at = now;
     }
   /*
    * Active set.  The peer counts only if we can reach it over the pair
@@ -343,6 +396,11 @@ cgnat_cluster_set (int enable, u8 node_id, ip4_address_t *local,
   cl->dup_last = 0;
   cl->last_peer_epoch = 0;
   cl->want_resync_peer = 0;
+  cl->incumbent = 0;
+  cl->resync_done = 0;
+  cl->resync_end_mask = 0;
+  cl->resync_end_needed = 0;
+  cl->resync_req_sent_at = 0;
   cl->sync_gen++;
   cl->peer_alive = cl->pair_alive = cl->ready = cl->fenced = 0;
   cl->serving = 0;

@@ -666,6 +666,118 @@ class TestCgnatClusterSyncWorkers(TestCgnatClusterSync):
     vpp_worker_count = 2
 
 
+class TestCgnatClusterFailover(TestCgnatClusterSync.__bases__[0]):
+    """Cluster resync, failover, failback (we are node 1)"""
+
+    # reuse the sync helpers without re-running the sync tests
+    syncs = TestCgnatClusterSync.syncs
+    flow = TestCgnatClusterSync.flow
+    sync_msg = TestCgnatClusterSync.sync_msg
+    sessions = TestCgnatClusterSync.sessions
+
+    def rejoin(self, seconds, **hello):
+        """Re-enable the cluster (starting again) while the peer says hello."""
+        self.pg2.enable_capture()
+        self.cluster_on(dead_interval_ms=self.dead_ms)
+        self.keep_hello(seconds, **hello)
+
+    def test_resync_request_answered(self):
+        """A RESYNC_REQ gets every session we hold, then RESYNC_END per thread"""
+        for i in range(30):
+            self.flow(self.host(i % 16), 9200 + i)
+        self.keep_hello(0.3)
+        self.pg2.enable_capture()
+        self.send_peer(self.msg(RESYNC_REQ))
+        self.keep_hello(0.5)
+        self.pg2.disable_capture()
+        recs, ends = set(), []
+        for p in rdpcap(self.pg2.out_path):
+            if UDP in p and p[UDP].dport == PORT:
+                h, body = parse(bytes(p[UDP].payload))
+                if h["type"] == SYNC:
+                    for r in parse_records(body)[2]:
+                        recs.add((r["in_addr"], r["in_port"]))
+                elif h["type"] == RESYNC_END:
+                    ends.append(END_BODY.unpack_from(body))
+        self.assertEqual(len(recs), 30)
+        self.assertTrue(ends)
+        n_threads = ends[0][1]
+        self.assertEqual({e[0] for e in ends}, set(range(n_threads)))
+
+    def test_joining_node_resyncs(self):
+        """Joining a ready peer: RESYNC_REQ, resyncing (peer owns all), ready after END"""
+        self.rejoin(2.3)
+        self.assertTrue(self.capture_msgs(self.pg2, RESYNC_REQ))
+        st = self.status()
+        self.assertEqual((st.ready, st.reason), (False, "resyncing"))
+        self.assertEqual(self.owners(64), {2: 64})
+        self.send_peer(self.msg(RESYNC_END, END_BODY.pack(0, 1)))
+        self.keep_hello(0.3)
+        self.assertTrue(self.status().ready)
+        self.assertEqual(set(self.owners(64)), {1, 2})
+
+    def test_incumbent_stays_ready(self):
+        """Already serving: a joining peer doesn't make us resync"""
+        self.pg2.enable_capture()
+        self.keep_hello(0.6, state=0)
+        self.assertTrue(self.status().ready)
+        self.assertEqual(self.capture_msgs(self.pg2, RESYNC_REQ), [])
+        self.assertEqual(self.owners(64), {1: 64})
+
+    def test_simultaneous_start(self):
+        """Both starting: the lower node id becomes ready without resyncing"""
+        self.rejoin(2.3, state=0)
+        self.assertTrue(self.status().ready)
+        self.assertEqual(self.capture_msgs(self.pg2, RESYNC_REQ), [])
+
+    def test_failover_uses_warm_copy(self):
+        """Peer dies: its subscribers' sessions continue from our warm copies"""
+        mine, theirs = self.split()
+        f = self.vapi.cgnat_forward(in_vrf=0, in_addr=theirs[0])
+        rec = record(1, theirs[0], 7000, str(f.out_addr), f.port_lo + 5,
+                     self.pg1.remote_ip4, 53)
+        self.send_peer(self.sync_msg(0, [rec]))
+        self.assertTrue(self.wait_for(lambda: not self.status().peer_alive, timeout=4))
+        self.assertEqual(self.owners(64), {1: 64})
+        reply = (Ether(src=self.pg1.remote_mac, dst=self.pg1.local_mac)
+                 / IP(src=self.pg1.remote_ip4, dst=str(f.out_addr))
+                 / UDP(sport=53, dport=f.port_lo + 5) / Raw(b"r" * 16))
+        rx = self.send_and_expect(self.pg1, [reply], self.pg0)[0]
+        self.assertEqual((rx[IP].dst, rx[UDP].dport), (theirs[0], 7000))
+
+    def test_failback_after_resync(self):
+        """A returning peer resyncs from us; it takes subscribers only once ready"""
+        self.flow(self.host(0), 9300)
+        self.keep_hello(0.3, state=0)
+        self.pg2.enable_capture()
+        self.send_peer(self.msg(RESYNC_REQ))
+        self.keep_hello(0.4, state=0)
+        self.assertTrue(self.capture_msgs(self.pg2, RESYNC_END))
+        self.assertEqual(self.owners(64), {1: 64})
+        self.keep_hello(0.4)
+        self.assertEqual(set(self.owners(64)), {1, 2})
+
+    def test_peer_fast_restart_resets_streams(self):
+        """A new peer epoch without a dead gap resets streams; we keep owning all"""
+        mine, theirs = self.split()
+        self.flow(mine[0], 9400)
+        self.keep_hello(0.3)
+        self.epoch = 0x5678
+        self.keep_hello(0.4, state=0)
+        self.assertEqual(self.owners(64), {1: 64})
+        self.pg2.enable_capture()
+        self.flow(mine[0], 9401)
+        msgs = self.syncs(0.1)
+        self.assertTrue(msgs)
+        self.assertEqual(min(m[0]["seq"] for m in msgs), 0)
+
+
+class TestCgnatClusterFailoverWorkers(TestCgnatClusterFailover):
+    """Cluster resync/failover/failback with 2 workers"""
+
+    vpp_worker_count = 2
+
+
 class TestCgnatClusterStartup(VppTestCase):
     """Cluster from startup.conf"""
 

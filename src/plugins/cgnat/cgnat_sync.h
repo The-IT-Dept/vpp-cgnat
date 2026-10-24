@@ -11,10 +11,14 @@
 #define CGNAT_SYNC_MAX_RECORDS 40    /* 1332-byte packets */
 #define CGNAT_SYNC_RTO	       0.05 /* seconds before a retransmit */
 #define CGNAT_SYNC_TICK	       0.01 /* flush / retransmit / ack tick */
+#define CGNAT_RESYNC_SLICE     2048 /* sessions walked per thread per tick */
 
 /* queue a record for the peer if we own the session's subscriber */
 void cgnat_sync_session (cgnat_per_thread_t *t, u32 thread_index,
 			 cgnat_session_t *s, u8 op);
+/* same, for any session we hold (resync walk) */
+void cgnat_sync_session_any (cgnat_per_thread_t *t, u32 thread_index,
+			     cgnat_session_t *s, u8 op);
 
 /* after a touch: sync on class change or when the refresh interval passed */
 static_always_inline void

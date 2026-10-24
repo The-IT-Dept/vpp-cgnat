@@ -80,6 +80,9 @@ typedef CLIB_PACKED (struct {
   u16 pad;
 }) cgnat_msg_sync_t;
 
+/* header flags (local use): records forwarded between our own threads */
+#define CGNAT_MSG_F_FORWARDED (1 << 0)
+
 #define CGNAT_REC_UPSERT 1
 #define CGNAT_REC_DELETE 2
 

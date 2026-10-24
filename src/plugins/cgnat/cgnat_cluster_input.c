@@ -20,6 +20,7 @@
   _ (STEER, "steer", "steered packets received")                              \
   _ (NO_TABLE, "no-table", "steered packet for an unknown table")             \
   _ (SYNC, "sync", "sync/ack packets received")                               \
+  _ (RESYNC, "resync", "resync requests/ends received")                       \
   _ (BAD, "bad", "malformed or wrong version")                                \
   _ (UNKNOWN_PATH, "unknown-path", "HELLO on no configured path")             \
   _ (DUPLICATE, "duplicate-node-id", "peer uses our node id")                 \
@@ -140,6 +141,27 @@ VLIB_NODE_FN (cgnat_cluster_input_node)
 	e = cgnat_cluster_hello (vm, cl, ip, h, len);
       else if (h->type == CGNAT_MSG_STEER)
 	e = cgnat_cluster_steer (vm, cl, b, ip, h, len, &next);
+      else if (h->type == CGNAT_MSG_RESYNC_REQ &&
+	       ip->src_address.as_u32 == cl->paths[0].peer.as_u32)
+	{
+	  /* the peer wants our whole table: every thread walks it */
+	  cl->want_resync_peer = 0;
+	  __atomic_add_fetch (&cl->resync_walk_gen, 1, __ATOMIC_RELEASE);
+	  e = CGNAT_CLUSTER_INPUT_ERROR_RESYNC;
+	}
+      else if (h->type == CGNAT_MSG_RESYNC_END &&
+	       len >= sizeof (*h) + sizeof (cgnat_msg_resync_end_t))
+	{
+	  cgnat_msg_resync_end_t *eb = (cgnat_msg_resync_end_t *) (h + 1);
+	  u32 src = clib_net_to_host_u16 (eb->src_thread);
+	  if (clib_net_to_host_u32 (h->epoch) == cl->resync_epoch && src < 64)
+	    {
+	      cl->resync_end_needed = clib_net_to_host_u16 (eb->n_src_threads);
+	      __atomic_or_fetch (&cl->resync_end_mask, 1ULL << src,
+				 __ATOMIC_RELEASE);
+	    }
+	  e = CGNAT_CLUSTER_INPUT_ERROR_RESYNC;
+	}
       else if ((h->type == CGNAT_MSG_SYNC || h->type == CGNAT_MSG_ACK) &&
 	       len >= sizeof (*h) + 8)
 	{

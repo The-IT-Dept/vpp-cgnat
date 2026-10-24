@@ -75,6 +75,16 @@ typedef struct
   volatile u8 want_resync_peer; /* a stream overflowed: ask peer to resync us */
   volatile u32 sync_gen;   /* bumped when the peer restarts (new epoch) */
   u32 last_peer_epoch;
+
+  /* resync: we join and pull the peer's table */
+  u8 incumbent;		       /* already serving: never resync from a joiner */
+  u8 resync_done;	       /* pulled the current peer epoch's table */
+  f64 resync_req_sent_at;
+  u32 resync_epoch;	       /* peer epoch our request went to */
+  volatile u64 resync_end_mask; /* peer threads that sent RESYNC_END */
+  volatile u16 resync_end_needed;
+  /* resync: the peer pulls ours (bumped on RESYNC_REQ; threads walk) */
+  volatile u32 resync_walk_gen;
   cgnat_cluster_reason_t reason;
 
   /* startup.conf cluster section, applied at main loop entry */
