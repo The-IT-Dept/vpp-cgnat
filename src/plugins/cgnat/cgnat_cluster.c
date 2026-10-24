@@ -228,7 +228,13 @@ cgnat_cluster_evaluate (vlib_main_t *vm, f64 now)
      peer, so we must not conclude we're alone */
   if (!vec_len (cl->paths) || !cgnat_path_link_up (&cl->paths[0]))
     cl->enabled_at = now; /* (a VF's link comes up after its address) */
-  starting = now - cl->enabled_at < cl->dead_interval;
+  /* ...and ends early the moment we hear the peer on the pair link
+     (both ways); otherwise after a dead interval plus margin for the
+     first ARP/HELLO round trips on a freshly-up link */
+  starting = now - cl->enabled_at < cl->dead_interval + 1.5 &&
+	     !(vec_len (cl->paths) && cl->paths[0].last_rx > 0 &&
+	       now - cl->paths[0].last_rx < cl->dead_interval &&
+	       cl->paths[0].heard_epoch == cl->epoch);
   dup = cl->dup_last > 0 && now - cl->dup_last < cl->dead_interval;
   mismatch = cl->peer_alive && cl->peer_config_hash != cl->config_hash;
 

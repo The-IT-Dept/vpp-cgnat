@@ -319,6 +319,17 @@ class TestCgnatClusterHello(CgnatClusterCase):
             self.cluster_on()
             self.vapi.bond_delete(sw_if_index=bond)
 
+    def test_peer_heard_late_still_joins(self):
+        """A ready peer first heard 0.7 s after start (link/ARP warm-up): we join and
+        resync, we don't declare ourselves alone and skip the resync"""
+        self.cluster_on()
+        self.sleep(0.7)
+        self.pg2.enable_capture()
+        self.keep_hello(1.0, state=READY)
+        st = self.status()
+        self.assertEqual(st.reason, "resyncing")
+        self.assertTrue(self.capture_msgs(self.pg2, RESYNC_REQ))
+
     def test_unconfigured_not_ready(self):
         """No maps: never ready (can't become the serving node)"""
         self.assertTrue(self.wait_for(lambda: self.status().ready))
@@ -645,7 +656,8 @@ class TestCgnatClusterSync(CgnatSteerHelpers):
         try:
             self.flow(mine[0], 6200)
             self.pg2.enable_capture()
-            self.keep_hello(1.6)
+            # timeout 1 s, plus up to ~1 s for lazy LRU relinking
+            self.keep_hello(2.6)
             recs = [r for m in self.syncs(0.05) for r in m[3]]
             self.assertIn((2, mine[0], 6200), [(r["op"], r["in_addr"], r["in_port"]) for r in recs])
         finally:
