@@ -584,7 +584,11 @@ VLIB_NODE_FN (cgnat_sync_flush_node)
     {
       u32 n = 0, end = vec_len (t->sessions_pool);
 
-      if (!cl->peer_alive || !cl->pair_alive)
+      /* give up if the peer dies mid-walk.  The request itself shows it
+	 was there: right after it comes back our liveness may not have
+	 caught up yet, and dropping that walk stalls its join */
+      if ((!cl->peer_alive || !cl->pair_alive) &&
+	  now - cl->resync_walk_started > cl->dead_interval)
 	t->resync_active = 0;
       while (t->resync_active && t->resync_cursor < end &&
 	     n < CGNAT_RESYNC_SLICE)

@@ -442,9 +442,9 @@ class TestCgnatClusterOwner(CgnatOwnerCase):
             st = self.status()
             self.assertEqual((st.ready, st.reason), (False, "interface-down"))
             self.assertEqual(self.owners(), {2: 256})
+            self.pg2.enable_capture()  # the request goes at the first tick after link
         finally:
             self.pg1.admin_up()
-        self.pg2.enable_capture()
         self.keep_hello(0.5)
         st = self.status()
         self.assertEqual((st.ready, st.reason), (False, "resyncing"))
@@ -933,6 +933,19 @@ class TestCgnatClusterFailover(TestCgnatClusterSync.__bases__[0]):
         self.pg2.enable_capture()
         self.cluster_on(dead_interval_ms=self.dead_ms)
         self.keep_hello(seconds, **hello)
+
+    def test_resync_request_from_freshly_restarted_peer_answered(self):
+        """A peer back from the dead asks for our table in the same breath as its
+        first HELLO, before our liveness check has caught up: the walk still runs
+        to RESYNC_END (the request proves the peer is there), it isn't dropped
+        for 30 s"""
+        for i in range(30):
+            self.flow(self.host(i % 16), 9500 + i)
+        self.assertFalse(self.status().peer_alive)
+        self.pg2.enable_capture()
+        self.send_peer([self.hello(state=READY), self.msg(RESYNC_REQ)])
+        self.keep_hello(0.5, state=READY)
+        self.assertTrue(self.capture_msgs(self.pg2, RESYNC_END))
 
     def test_resync_request_answered(self):
         """A RESYNC_REQ gets every session we hold, then RESYNC_END per thread"""
