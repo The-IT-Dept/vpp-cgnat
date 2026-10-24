@@ -9,9 +9,11 @@
 #include <cgnat/cgnat.h>
 #include <cgnat/cgnat_session.h>
 #include <cgnat/cgnat_inlines.h>
+#include <vnet/ip/ip4_to_ip6.h>
 
 #define foreach_cgnat_in2out_error                                            \
   _ (NO_MAP, "no-map", "source address in no map")                            \
+  _ (NO_MAPPING, "no-mapping", "ICMP error for an unknown flow")              \
   _ (CAP, "cap", "subscriber session limit reached")                          \
   _ (EXHAUSTED, "exhausted", "subscriber port block exhausted")               \
   _ (UNSUPPORTED, "unsupported", "protocol not translated")                   \
@@ -59,8 +61,47 @@ format_cgnat_in2out_trace (u8 *s, va_list *args)
 		 t->session_index);
 }
 
+/*
+ * A subscriber's ICMP error about an inbound packet (e.g. port
+ * unreachable): the quoted packet is remote -> subscriber.
+ */
 static_always_inline u32
-cgnat_in2out_one (vlib_node_runtime_t *node, cgnat_per_thread_t *t,
+cgnat_in2out_icmp_error (vlib_main_t *vm, vlib_node_runtime_t *node,
+			 cgnat_per_thread_t *t, vlib_buffer_t *b,
+			 ip4_header_t *ip, u32 rx_fib, cgnat_mapping_t **mp)
+{
+  ip4_header_t *inner;
+  cgnat_mapping_t *m;
+  u16 sport, dport;
+  u32 avail;
+  u8 iproto;
+
+  inner = cgnat_icmp_error_inner (ip, &iproto, &sport, &dport, &avail);
+  if (!inner || inner->dst_address.as_u32 != ip->src_address.as_u32)
+    {
+      b->error = node->errors[CGNAT_IN2OUT_ERROR_UNSUPPORTED];
+      return CGNAT_IN2OUT_NEXT_DROP;
+    }
+  m = cgnat_mapping_find (t, 0, rx_fib, inner->dst_address.as_u32, dport,
+			  iproto);
+  if (!m || !cgnat_session_find (t, m - t->mappings,
+				 inner->src_address.as_u32,
+				 iproto == CGNAT_PROTO_ICMP ? 0 : sport))
+    {
+      b->error = node->errors[CGNAT_IN2OUT_ERROR_NO_MAPPING];
+      return CGNAT_IN2OUT_NEXT_DROP;
+    }
+  cgnat_rewrite (ip, 1, m->out_addr.as_u32, 0, iproto, 1 /* ip only */);
+  cgnat_rewrite_inner (inner, 0, m->out_addr.as_u32, m->out_port, iproto,
+		       avail);
+  cgnat_icmp_checksum (vm, b, ip);
+  vnet_buffer (b)->sw_if_index[VLIB_TX] = m->out_fib_index;
+  *mp = m;
+  return CGNAT_IN2OUT_NEXT_LOOKUP;
+}
+
+static_always_inline u32
+cgnat_in2out_one (vlib_main_t *vm, vlib_node_runtime_t *node, cgnat_per_thread_t *t,
 		  u32 thread_index, vlib_buffer_t *b, f64 now,
 		  cgnat_mapping_t **mp, cgnat_session_t **sp)
 {
@@ -80,8 +121,17 @@ cgnat_in2out_one (vlib_node_runtime_t *node, cgnat_per_thread_t *t,
   proto = cgnat_proto_of (ip->protocol);
   map = cgnat_map_by_inside (rx_fib, &ip->src_address);
 
-  if (PREDICT_FALSE (!map || proto != CGNAT_PROTO_UDP &&
-				 proto != CGNAT_PROTO_TCP))
+  if (proto == CGNAT_PROTO_ICMP && map)
+    {
+      u8 type = vnet_buffer (b)->ip.reass.icmp_type_or_tcp_flags;
+      if (icmp_type_is_error_message (type) && !non_first &&
+	  !cgnat_is_local (rx_fib, &ip->dst_address))
+	return cgnat_in2out_icmp_error (vm, node, t, b, ip, rx_fib, mp);
+      if (type != ICMP4_echo_request)
+	proto = CGNAT_N_PROTO; /* not translated */
+    }
+
+  if (PREDICT_FALSE (!map || proto == CGNAT_N_PROTO))
     {
       /* traffic for this box itself passes untouched */
       if (cgnat_is_local (rx_fib, &ip->dst_address))
@@ -105,7 +155,7 @@ cgnat_in2out_one (vlib_node_runtime_t *node, cgnat_per_thread_t *t,
     }
 
   in_port = vnet_buffer (b)->ip.reass.l4_src_port;
-  r_port = vnet_buffer (b)->ip.reass.l4_dst_port;
+  r_port = proto == CGNAT_PROTO_ICMP ? 0 : vnet_buffer (b)->ip.reass.l4_dst_port;
 
   m = cgnat_mapping_find (t, 0, rx_fib, ip->src_address.as_u32, in_port,
 			  proto);
@@ -181,7 +231,7 @@ VLIB_NODE_FN (cgnat_in2out_node)
       cgnat_mapping_t *m = 0;
       cgnat_session_t *s = 0;
 
-      next[0] = cgnat_in2out_one (node, t, thread_index, b[0], now, &m, &s);
+      next[0] = cgnat_in2out_one (vm, node, t, thread_index, b[0], now, &m, &s);
       if (PREDICT_FALSE (b[0]->flags & VLIB_BUFFER_IS_TRACED))
 	{
 	  cgnat_in2out_trace_t *tr =

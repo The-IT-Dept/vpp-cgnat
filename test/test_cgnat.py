@@ -396,5 +396,84 @@ class TestCgnatExhaust(CgnatPgCase):
         self.assertEqual(self.err("cgnat-in2out", "exhausted") - before, 1)
 
 
+class TestCgnatIcmp(CgnatPgCase):
+    """CGNAT ICMP: echo and error translation"""
+
+    def icmp_err_out(self, src, dst, inner):
+        return (
+            Ether(src=self.pg1.remote_mac, dst=self.pg1.local_mac)
+            / IP(src=src, dst=dst)
+            / ICMP(type="dest-unreach", code="port-unreachable")
+            / inner
+        )
+
+    def test_echo_out_and_back(self):
+        """Echo id is translated like a port and restored on the reply"""
+        h, r = self.host(), self.pg1.remote_ip4
+        p = (
+            Ether(src=self.pg0.remote_mac, dst=self.pg0.local_mac)
+            / IP(src=h, dst=r)
+            / ICMP(type="echo-request", id=1234, seq=1)
+            / Raw(b"ping")
+        )
+        rx = self.send_and_expect(self.pg0, [p], self.pg1)[0]
+        out, port = self.first_choice(h, 1234)
+        self.assertEqual((rx[IP].src, rx[ICMP].id), (out, port))
+        self.assert_packet_checksums_valid(rx)
+        reply = (
+            Ether(src=self.pg1.remote_mac, dst=self.pg1.local_mac)
+            / IP(src=r, dst=out)
+            / ICMP(type="echo-reply", id=port, seq=1)
+            / Raw(b"ping")
+        )
+        rx = self.send_and_expect(self.pg1, [reply], self.pg0)[0]
+        self.assertEqual((rx[IP].dst, rx[ICMP].id), (h, 1234))
+        self.assert_packet_checksums_valid(rx)
+
+    def test_error_for_udp_flow(self):
+        """ICMP error about a translated UDP flow reaches the subscriber, inner restored"""
+        h, r = self.host(), self.pg1.remote_ip4
+        rx = self.in2out(h, 5000, r, 53)
+        out, port = rx[IP].src, rx[UDP].sport
+        router = self.pg1.remote_hosts[2].ip4
+        err = self.icmp_err_out(
+            router, out, IP(src=out, dst=r) / UDP(sport=port, dport=53) / Raw(b"x" * 8)
+        )
+        rx = self.send_and_expect(self.pg1, [err], self.pg0)[0]
+        self.assertEqual(rx[IP].dst, h)
+        self.assertEqual((rx[IPerror].src, rx[UDPerror].sport), (h, 5000))
+        self.assert_packet_checksums_valid(rx)
+
+    def test_error_without_flow_dropped(self):
+        """ICMP error quoting an unknown flow is dropped (no-mapping)"""
+        r = self.pg1.remote_ip4
+        out, lo, hi = self.block(self.host())
+        before = self.err("cgnat-out2in", "no-mapping")
+        err = self.icmp_err_out(
+            r, out, IP(src=out, dst=r) / UDP(sport=lo + 7, dport=53) / Raw(b"x" * 8)
+        )
+        self.send_and_assert_no_replies(self.pg1, [err], remark="unknown flow")
+        self.assertEqual(self.err("cgnat-out2in", "no-mapping") - before, 1)
+
+    def test_inside_error_translated(self):
+        """ICMP error sent by a subscriber about an inbound packet is translated out"""
+        self.vapi.cgnat_set_filtering(endpoint_independent=0)
+        h, r = self.host(), self.pg1.remote_ip4
+        rx = self.in2out(h, 5100, r, 53)
+        out, port = rx[IP].src, rx[UDP].sport
+        p = (
+            Ether(src=self.pg0.remote_mac, dst=self.pg0.local_mac)
+            / IP(src=h, dst=r)
+            / ICMP(type="dest-unreach", code="port-unreachable")
+            / IP(src=r, dst=h)
+            / UDP(sport=53, dport=5100)
+            / Raw(b"x" * 8)
+        )
+        rx = self.send_and_expect(self.pg0, [p], self.pg1)[0]
+        self.assertEqual(rx[IP].src, out)
+        self.assertEqual((rx[IPerror].dst, rx[UDPerror].dport), (out, port))
+        self.assert_packet_checksums_valid(rx)
+
+
 if __name__ == "__main__":
     unittest.main(testRunner=VppTestRunner)
