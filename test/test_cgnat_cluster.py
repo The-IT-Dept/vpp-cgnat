@@ -359,8 +359,8 @@ class TestCgnatClusterFence(CgnatOwnerCase):
         self.assertEqual(self.owners(), {1: 256})
 
 
-class TestCgnatClusterSteer(CgnatOwnerCase):
-    """Cluster steering over the pair link (we are node 1)"""
+class CgnatSteerHelpers(CgnatOwnerCase):
+    """Helpers for split ownership with a scapy peer (no tests here)."""
 
     def peer_hosts(self, owner):
         out = []
@@ -395,6 +395,10 @@ class TestCgnatClusterSteer(CgnatOwnerCase):
         self.pg_start()
         self.sleep(0.2)
         return self.capture_msgs(self.pg2, STEER)
+
+
+class TestCgnatClusterSteer(CgnatSteerHelpers):
+    """Cluster steering over the pair link (we are node 1)"""
 
     def test_outbound_for_peer_steered(self):
         """Outbound from a peer-owned subscriber goes to the peer, untouched"""
@@ -493,6 +497,173 @@ class TestCgnatClusterSteerFenced(CgnatOwnerCase):
              / IP(src=self.host(0), dst=self.pg1.remote_ip4) / UDP(sport=5000, dport=53))
         self.assert_not_translated([p], remark="fenced")
         self.assertEqual(self.err("cgnat-in2out", "fenced") - before, 1)
+
+
+class TestCgnatClusterSync(CgnatSteerHelpers):
+    """Cluster session sync (we are node 1)"""
+
+    def syncs(self, seconds=0.2):
+        """Capture SYNC messages on pg2 for `seconds`: [(hdr, src, dst, records)]"""
+        self.pg2.enable_capture()
+        self.sleep(seconds)
+        out = []
+        for p, h, body in self.capture_msgs(self.pg2, SYNC):
+            src, dst, recs = parse_records(body)
+            out.append((h, src, dst, recs))
+        return out
+
+    def flow(self, src, sport):
+        return self.send_and_expect(self.pg0, [self.udp_in(src, sport=sport)], self.pg1)[0]
+
+    def ack(self, seq, src_thread=0, dst_thread=0):
+        return self.msg(ACK, ACK_BODY.pack(src_thread, dst_thread, 0), seq=seq)
+
+    def sync_msg(self, seq, records, src_thread=0, dst_thread=0):
+        return self.msg(SYNC, SYNC_BODY.pack(src_thread, dst_thread, len(records), 0)
+                        + b"".join(records), seq=seq)
+
+    def sessions(self, host):
+        return list(self.vapi.cgnat_session_dump(in_vrf=0, in_addr=host))
+
+    def test_create_emits_upsert(self):
+        """A new session is synced to the peer as an upsert record"""
+        mine, theirs = self.split()
+        self.pg2.enable_capture()
+        rx = self.flow(mine[0], 6000)
+        msgs = self.syncs(0.2)
+        recs = [r for m in msgs for r in m[3]]
+        self.assertTrue(recs)
+        r = recs[0]
+        self.assertEqual((r["op"], r["in_addr"], r["in_port"]), (1, mine[0], 6000))
+        self.assertEqual((r["out_addr"], r["out_port"]), (rx[IP].src, rx[UDP].sport))
+        self.assertEqual((r["remote_addr"], r["remote_port"]), (self.pg1.remote_ip4, 53))
+
+    def test_batching(self):
+        """A burst of new sessions travels in multi-record SYNC packets"""
+        mine, theirs = self.split()
+        pkts = [self.udp_in(mine[i % len(mine)], sport=7000 + i) for i in range(40)]
+        self.pg2.enable_capture()
+        self.send_and_expect(self.pg0, pkts, self.pg1)
+        by_seq = {}
+        for h, src, dst, recs in self.syncs(0.2):
+            by_seq[(src, h["seq"])] = recs
+        self.assertEqual(sum(len(r) for r in by_seq.values()), 40)
+        self.assertTrue(any(len(r) > 1 for r in by_seq.values()))
+
+    def test_retransmit_until_ack(self):
+        """Unacknowledged SYNC is retransmitted; an ACK stops it"""
+        mine, theirs = self.split()
+        self.flow(mine[0], 6100)
+        msgs = self.syncs(0.3)
+        seqs = [m[0]["seq"] for m in msgs]
+        self.assertGreaterEqual(seqs.count(seqs[0]), 2, seqs)
+        h, src, dst, recs = msgs[0]
+        self.send_peer(self.ack(max(seqs), src_thread=src, dst_thread=dst))
+        self.sleep(0.1)
+        self.assertEqual(self.syncs(0.3), [])
+
+    def test_delete_on_expiry(self):
+        """An expired session is synced as a delete record"""
+        mine, theirs = self.split()
+        self.vapi.cgnat_set_timeouts(tcp_established=7440, tcp_transitory=240, udp=1, icmp=60)
+        try:
+            self.flow(mine[0], 6200)
+            self.pg2.enable_capture()
+            self.keep_hello(1.6)
+            recs = [r for m in self.syncs(0.05) for r in m[3]]
+            self.assertIn((2, mine[0], 6200), [(r["op"], r["in_addr"], r["in_port"]) for r in recs])
+        finally:
+            self.vapi.cgnat_set_timeouts(tcp_established=7440, tcp_transitory=240, udp=300,
+                                         icmp=60)
+
+    def test_apply_upsert_warm(self):
+        """An upsert from the peer installs a warm copy, and we ACK it"""
+        mine, theirs = self.split()
+        f = self.vapi.cgnat_forward(in_vrf=0, in_addr=theirs[0])
+        rec = record(1, theirs[0], 7000, str(f.out_addr), f.port_lo + 5,
+                     self.pg1.remote_ip4, 53)
+        self.pg2.enable_capture()
+        self.send_peer(self.sync_msg(0, [rec]))
+        self.sleep(0.1)
+        acks = self.capture_msgs(self.pg2, ACK)
+        self.assertTrue(acks)
+        self.assertEqual(acks[0][1]["seq"], 0)
+        ss = self.sessions(theirs[0])
+        self.assertEqual(len(ss), 1)
+        self.assertTrue(ss[0].warm)
+        self.assertEqual((ss[0].in_port, ss[0].out_port), (7000, f.port_lo + 5))
+        # and a delete removes it
+        rec = record(2, theirs[0], 7000, str(f.out_addr), f.port_lo + 5,
+                     self.pg1.remote_ip4, 53)
+        self.send_peer(self.sync_msg(1, [rec]))
+        self.sleep(0.1)
+        self.assertEqual(self.sessions(theirs[0]), [])
+
+    def test_record_for_unknown_map_rejected(self):
+        """A record for a map we don't have is rejected and counted"""
+        mine, theirs = self.split()
+        before = self.err("cgnat-sync-worker", "sync-unknown-map")
+        rec = record(1, "10.99.0.1", 7000, "192.0.2.1", 2000, self.pg1.remote_ip4, 53,
+                     in_table_id=77)
+        self.send_peer(self.sync_msg(0, [rec]))
+        self.sleep(0.1)
+        self.assertEqual(self.err("cgnat-sync-worker", "sync-unknown-map") - before, 1)
+        self.assertEqual(self.vapi.cgnat_get_status().sessions, 0)
+
+    def test_window_overflow_triggers_resync(self):
+        """Stream overflow: oldest dropped, want_resync advertised, no session lost"""
+        mine, theirs = self.split()
+        self.vapi.cli("cgnat cluster window 8")
+        try:
+            for i in range(20):
+                self.flow(mine[i % len(mine)], 8000 + i)
+                self.sleep(0.02)
+            ov = self.statistics.get_counter("/cgnat/sync/overflow")
+            self.assertGreater(sum(sum(x) for x in ov), 0)
+            self.pg2.enable_capture()
+            self.keep_hello(0.3)
+            hellos = self.capture_msgs(self.pg2, HELLO)
+            self.assertTrue(any(HELLO_BODY.unpack_from(b)[1] & WANT_RESYNC
+                                for p, h, b in hellos))
+            self.assertEqual(self.vapi.cgnat_get_status().sessions, 20)
+        finally:
+            self.vapi.cli("cgnat cluster window 1024")
+
+    def test_dst_thread_follows_peer_workers(self):
+        """Records are addressed to the peer worker that owns the subscriber there"""
+        self.keep_hello(0.4, n_workers=4, first_worker=1)
+        mine = self.peer_hosts(1)
+        pkts = [self.udp_in(h, sport=9100) for h in mine]
+        self.pg2.enable_capture()
+        self.send_and_expect(self.pg0, pkts, self.pg1)
+        dsts = {dst for h, src, dst, recs in self.syncs(0.2)}
+        self.assertTrue(dsts <= {1, 2, 3, 4}, dsts)
+        self.assertGreater(len(dsts), 1, dsts)
+
+    def test_warm_grace(self):
+        """Warm copies outlive the timeout by the refresh interval"""
+        self.cluster_on(dead_interval_ms=self.dead_ms, refresh_interval_s=3)
+        self.assertTrue(self.wait_for(lambda: self.status().ready, timeout=4))
+        mine, theirs = self.split()
+        self.vapi.cgnat_set_timeouts(tcp_established=7440, tcp_transitory=240, udp=1, icmp=60)
+        try:
+            f = self.vapi.cgnat_forward(in_vrf=0, in_addr=theirs[0])
+            rec = record(1, theirs[0], 7100, str(f.out_addr), f.port_lo + 9,
+                         self.pg1.remote_ip4, 53)
+            self.send_peer(self.sync_msg(0, [rec]))
+            self.keep_hello(2.0)
+            self.assertEqual(len(self.sessions(theirs[0])), 1)
+            self.keep_hello(3.0)
+            self.assertEqual(self.sessions(theirs[0]), [])
+        finally:
+            self.vapi.cgnat_set_timeouts(tcp_established=7440, tcp_transitory=240, udp=300,
+                                         icmp=60)
+
+
+class TestCgnatClusterSyncWorkers(TestCgnatClusterSync):
+    """Cluster session sync with 2 workers"""
+
+    vpp_worker_count = 2
 
 
 class TestCgnatClusterStartup(VppTestCase):

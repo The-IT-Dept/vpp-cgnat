@@ -69,6 +69,12 @@ typedef struct
   u8 fenced;
   u8 serving; /* data path may translate (owner checks come on top) */
   u32 active_word; /* active node set, see cgnat_owner.h */
+
+  /* sync */
+  u32 window;		   /* unacked SYNCs kept per stream */
+  volatile u8 want_resync_peer; /* a stream overflowed: ask peer to resync us */
+  volatile u32 sync_gen;   /* bumped when the peer restarts (new epoch) */
+  u32 last_peer_epoch;
   cgnat_cluster_reason_t reason;
 
   /* startup.conf cluster section, applied at main loop entry */

@@ -19,6 +19,7 @@
   _ (HELLO, "hello", "HELLOs received")                                       \
   _ (STEER, "steer", "steered packets received")                              \
   _ (NO_TABLE, "no-table", "steered packet for an unknown table")             \
+  _ (SYNC, "sync", "sync/ack packets received")                               \
   _ (BAD, "bad", "malformed or wrong version")                                \
   _ (UNKNOWN_PATH, "unknown-path", "HELLO on no configured path")             \
   _ (DUPLICATE, "duplicate-node-id", "peer uses our node id")                 \
@@ -44,6 +45,7 @@ typedef enum
   CGNAT_CLUSTER_INPUT_NEXT_IN2OUT,
   CGNAT_CLUSTER_INPUT_NEXT_OUT2IN,
   CGNAT_CLUSTER_INPUT_NEXT_HAIRPIN,
+  CGNAT_CLUSTER_INPUT_NEXT_SYNC,
   CGNAT_CLUSTER_INPUT_N_NEXT,
 } cgnat_cluster_input_next_t;
 
@@ -117,6 +119,9 @@ VLIB_NODE_FN (cgnat_cluster_input_node)
   cgnat_cluster_t *cl = &cgnat_main.cluster;
   u32 *from = vlib_frame_vector_args (frame), n = frame->n_vectors, i;
   u16 nexts[VLIB_FRAME_SIZE];
+  u32 local_bi[VLIB_FRAME_SIZE], ho_bi[VLIB_FRAME_SIZE];
+  u16 local_next[VLIB_FRAME_SIZE], ho_ti[VLIB_FRAME_SIZE];
+  u32 n_local = 0, n_ho = 0;
 
   for (i = 0; i < n; i++)
     {
@@ -135,12 +140,44 @@ VLIB_NODE_FN (cgnat_cluster_input_node)
 	e = cgnat_cluster_hello (vm, cl, ip, h, len);
       else if (h->type == CGNAT_MSG_STEER)
 	e = cgnat_cluster_steer (vm, cl, b, ip, h, len, &next);
+      else if ((h->type == CGNAT_MSG_SYNC || h->type == CGNAT_MSG_ACK) &&
+	       len >= sizeof (*h) + 8)
+	{
+	  /* SYNC: to our thread named as dst; ACK: to the stream's sender,
+	     our thread named as src */
+	  u16 *tp = (u16 *) (h + 1);
+	  u32 target =
+	    clib_net_to_host_u16 (h->type == CGNAT_MSG_SYNC ? tp[1] : tp[0]);
+	  e = CGNAT_CLUSTER_INPUT_ERROR_SYNC;
+	  if (target >= vlib_get_n_threads ())
+	    e = CGNAT_CLUSTER_INPUT_ERROR_BAD;
+	  else if (target != vm->thread_index)
+	    {
+	      vlib_node_increment_counter (vm, node->node_index, e, 1);
+	      ho_bi[n_ho] = from[i];
+	      ho_ti[n_ho++] = target;
+	      nexts[i] = ~0;
+	      continue;
+	    }
+	  else
+	    next = CGNAT_CLUSTER_INPUT_NEXT_SYNC;
+	}
       else
 	e = CGNAT_CLUSTER_INPUT_ERROR_UNSUPPORTED;
       vlib_node_increment_counter (vm, node->node_index, e, 1);
       nexts[i] = next;
     }
-  vlib_buffer_enqueue_to_next (vm, node, from, nexts, n);
+  for (i = 0; i < n; i++)
+    if (nexts[i] != (u16) ~0)
+      {
+	local_bi[n_local] = from[i];
+	local_next[n_local++] = nexts[i];
+      }
+  if (n_local)
+    vlib_buffer_enqueue_to_next (vm, node, local_bi, local_next, n_local);
+  if (n_ho)
+    vlib_buffer_enqueue_to_thread (vm, node, cgnat_main.fq_sync_index, ho_bi,
+				   ho_ti, n_ho, 1);
   return n;
 }
 
@@ -156,5 +193,6 @@ VLIB_REGISTER_NODE (cgnat_cluster_input_node) = {
     [CGNAT_CLUSTER_INPUT_NEXT_IN2OUT] = "cgnat-in2out-steered",
     [CGNAT_CLUSTER_INPUT_NEXT_OUT2IN] = "cgnat-out2in-steered",
     [CGNAT_CLUSTER_INPUT_NEXT_HAIRPIN] = "cgnat-hairpin-steered",
+    [CGNAT_CLUSTER_INPUT_NEXT_SYNC] = "cgnat-sync-worker",
   },
 };

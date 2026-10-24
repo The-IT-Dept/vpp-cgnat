@@ -98,7 +98,8 @@ cgnat_session_t *cgnat_session_create (cgnat_per_thread_t *t,
 static_always_inline int
 cgnat_session_expired (cgnat_session_t *s, f64 now)
 {
-  return now - s->last_heard >= cgnat_main.timeouts[s->to_class];
+  f64 grace = s->warm ? cgnat_main.cluster.refresh_interval : 0;
+  return now - s->last_heard >= cgnat_main.timeouts[s->to_class] + grace;
 }
 
 /* room for one more session on this thread / for this subscriber? */

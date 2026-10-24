@@ -5,6 +5,7 @@
 
 #include <cgnat/cgnat.h>
 #include <cgnat/cgnat_session.h>
+#include <cgnat/cgnat_sync.h>
 
 cgnat_sub_t *
 cgnat_sub_get (cgnat_per_thread_t *t, u32 thread_index, u32 in_fib_index,
@@ -144,6 +145,7 @@ cgnat_session_create (cgnat_per_thread_t *t, u32 thread_index,
   s->remote_port = rport;
   s->to_class = to_class;
   s->last_heard = now;
+  s->last_synced = now;
   s->inbound = inbound;
 
   pool_get (t->lru_pool, e);
@@ -172,6 +174,8 @@ cgnat_session_free (cgnat_per_thread_t *t, u32 thread_index,
   cgnat_mapping_t *m = pool_elt_at_index (t->mappings, s->mapping_index);
   cgnat_sub_t *sub = pool_elt_at_index (t->subs_pool, m->sub_index);
   u8 inbound = s->inbound;
+
+  cgnat_sync_session (t, thread_index, s, CGNAT_REC_DELETE);
 
   cgnat_session_kv (&kv, s->mapping_index, s->remote_addr.as_u32,
 		    s->remote_port);

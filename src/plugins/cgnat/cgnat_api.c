@@ -236,6 +236,7 @@ vl_api_cgnat_session_dump_t_handler (vl_api_cgnat_session_dump_t *mp)
 	  strncpy ((char *) rmp->timeout_class, cgnat_class_name[s->to_class],
 		   sizeof (rmp->timeout_class) - 1);
 	  rmp->idle = clib_host_to_net_f64 (now - s->last_heard);
+	  rmp->warm = s->warm;
 	  vl_api_send_msg (reg, (u8 *) rmp);
 	}
     }

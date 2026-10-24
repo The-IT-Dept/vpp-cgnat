@@ -52,7 +52,8 @@ VLIB_NODE_FN (cgnat_expire_walk_node)
 	    break;
 	  s = pool_elt_at_index (t->sessions_pool,
 				 pool_elt_at_index (t->lru_pool, oldest)->value);
-	  if (now - s->last_heard < timeout)
+	  if (now - s->last_heard <
+	      timeout + (s->warm ? cm->cluster.refresh_interval : 0))
 	    break;
 	  cgnat_session_free (t, thread_index, s);
 	  n++;

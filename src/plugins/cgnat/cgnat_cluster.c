@@ -140,7 +140,8 @@ cgnat_cluster_send_hellos (vlib_main_t *vm)
 	break;
       hb->path_id = i;
       hb->state = (cl->ready ? CGNAT_HELLO_READY : 0) |
-		  (cl->fenced ? CGNAT_HELLO_FENCED : 0);
+		  (cl->fenced ? CGNAT_HELLO_FENCED : 0) |
+		  (cl->want_resync_peer ? CGNAT_HELLO_WANT_RESYNC : 0);
       hb->n_workers = clib_host_to_net_u16 (cm->n_workers);
       hb->first_worker = clib_host_to_net_u16 (cm->first_worker_index);
       hb->pad = 0;
@@ -160,6 +161,12 @@ cgnat_cluster_evaluate (vlib_main_t *vm, f64 now)
   u32 n = 0, a = 0, b = 0;
 
   cl->config_hash = cgnat_config_hash ();
+  if (cl->peer_epoch && cl->peer_epoch != cl->last_peer_epoch)
+    {
+      /* a new peer incarnation: reset sync streams on every thread */
+      cl->last_peer_epoch = cl->peer_epoch;
+      cl->sync_gen++;
+    }
   cl->peer_alive = 0;
   vec_foreach (p, cl->paths)
     {
@@ -334,6 +341,9 @@ cgnat_cluster_set (int enable, u8 node_id, ip4_address_t *local,
   cl->peer_epoch = 0;
   cl->peer_state = 0;
   cl->dup_last = 0;
+  cl->last_peer_epoch = 0;
+  cl->want_resync_peer = 0;
+  cl->sync_gen++;
   cl->peer_alive = cl->pair_alive = cl->ready = cl->fenced = 0;
   cl->serving = 0;
   cl->reason = CGNAT_REASON_STARTING;
@@ -382,6 +392,7 @@ cgnat_cluster_init (vlib_main_t *vm)
   cgnat_cluster_t *cl = &cgnat_main.cluster;
 
   cl->serving = 1; /* no cluster: a lone node always translates */
+  cl->window = 1024;
   cl->ready_gauge = vlib_stats_add_gauge ("/cgnat/cluster/ready");
   cl->peer_alive_gauge = vlib_stats_add_gauge ("/cgnat/cluster/peer-alive");
   cl->fenced_gauge = vlib_stats_add_gauge ("/cgnat/cluster/fenced");

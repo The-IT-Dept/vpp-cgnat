@@ -14,6 +14,7 @@ add_vpp_plugin(cgnat
   cgnat_cluster.c
   cgnat_cluster_input.c
   cgnat_steer.c
+  cgnat_sync.c
 
   MULTIARCH_SOURCES
   cgnat_in2out.c

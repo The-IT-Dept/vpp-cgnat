@@ -392,6 +392,7 @@ cgnat_cluster_command_fn (vlib_main_t *vm, unformat_input_t *input,
 {
   ip4_address_t local = {}, peer = {};
   u32 node_id = 0, table_id = 0, port = 0, hello = 0, dead = 0, refresh = 0;
+  u32 window = 0;
   int rv, is_add = 1, path = 0;
 
   while (unformat_check_input (input) != UNFORMAT_END_OF_INPUT)
@@ -420,9 +421,17 @@ cgnat_cluster_command_fn (vlib_main_t *vm, unformat_input_t *input,
 	;
       else if (unformat (input, "refresh-interval %u", &refresh))
 	;
+      else if (unformat (input, "window %u", &window) && window)
+	;
       else
 	return clib_error_return (0, "unknown input '%U'",
 				  format_unformat_error, input);
+    }
+  if (window)
+    {
+      cgnat_main.cluster.window = window;
+      if (!node_id && !path)
+	return 0;
     }
   if (path)
     rv = cgnat_cluster_path_add_del (&local, &peer, table_id, is_add);

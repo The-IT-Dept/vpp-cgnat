@@ -41,6 +41,10 @@ typedef enum
   _ (HAIRPIN_PACKETS, "hairpin-packets")                                      \
   _ (STEERED_OUT, "steered-out")                                              \
   _ (STEERED_IN, "steered-in")                                                \
+  _ (SYNC_RECORDS_OUT, "sync/records-out")                                    \
+  _ (SYNC_RECORDS_IN, "sync/records-in")                                      \
+  _ (SYNC_RETRANSMITS, "sync/retransmits")                                    \
+  _ (SYNC_OVERFLOW, "sync/overflow")                                          \
   _ (SESSIONS, "sessions")                                                    \
   _ (MAPPINGS, "mappings")                                                    \
   _ (SUBSCRIBERS, "subscribers")
@@ -84,6 +88,8 @@ typedef struct
   u8 tcp_state;
   u8 to_class;
   u8 inbound; /* created by an inbound packet (counts against inbound cap) */
+  u8 warm;    /* copy of a session the peer owns (installed by sync) */
+  f64 last_synced;
   f64 last_heard;
   u32 lru_index;
 } cgnat_session_t;
@@ -98,6 +104,31 @@ typedef struct
   u32 n_mappings;
 } cgnat_sub_t;
 
+/* a sent SYNC kept until acknowledged */
+typedef struct
+{
+  u32 seq;
+  u32 bi; /* copy of what was sent */
+  f64 sent;
+} cgnat_sync_pending_t;
+
+/* one direction of one (local thread -> peer thread) stream */
+typedef struct
+{
+  u32 bi; /* SYNC being filled, ~0 if none */
+  u16 n_records;
+  u32 next_seq;
+  cgnat_sync_pending_t *unacked; /* oldest first */
+} cgnat_sync_tx_t;
+
+/* what we've received from one peer thread */
+typedef struct
+{
+  u32 epoch;
+  u32 expected; /* next in-order seq */
+  u8 ack_pending;
+} cgnat_sync_rx_t;
+
 typedef struct
 {
   clib_bihash_16_8_t in2out;   /* (in fib, in addr, in port, proto) -> mapping */
@@ -110,6 +141,11 @@ typedef struct
   cgnat_sub_t *subs_pool;
   dlist_elt_t *lru_pool;
   u32 lru_head[CGNAT_N_TO];
+
+  /* session sync */
+  cgnat_sync_tx_t *sync_tx; /* by peer thread */
+  cgnat_sync_rx_t *sync_rx; /* by peer thread */
+  u32 sync_gen;
 } cgnat_per_thread_t;
 
 typedef struct
@@ -130,6 +166,7 @@ typedef struct
   u32 fq_in2out_steered_index;
   u32 fq_out2in_steered_index;
   u32 fq_hairpin_steered_index;
+  u32 fq_sync_index;
 
   /* policy */
   u32 timeouts[CGNAT_N_TO];

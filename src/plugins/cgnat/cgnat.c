@@ -9,6 +9,7 @@
 #include <vpp/app/version.h>
 #include <cgnat/cgnat.h>
 #include <cgnat/cgnat_session.h>
+#include <cgnat/cgnat_sync.h>
 
 cgnat_main_t cgnat_main;
 
@@ -249,6 +250,8 @@ cgnat_main_loop_enter (vlib_main_t *vm)
     vlib_frame_queue_main_init (cgnat_out2in_steered_node.index, 0);
   cm->fq_hairpin_steered_index =
     vlib_frame_queue_main_init (cgnat_hairpin_steered_node.index, 0);
+  cm->fq_sync_index =
+    vlib_frame_queue_main_init (cgnat_sync_worker_node.index, 0);
 
   /* cluster from startup.conf */
   {

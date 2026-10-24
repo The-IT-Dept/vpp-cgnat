@@ -153,6 +153,7 @@ define cgnat_session_details {
   u8 proto;
   string timeout_class[16];
   f64 idle;
+  bool warm;
 };
 
 define cgnat_get_status {

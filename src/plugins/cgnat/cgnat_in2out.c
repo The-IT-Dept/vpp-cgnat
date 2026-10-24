@@ -9,6 +9,7 @@
 #include <cgnat/cgnat.h>
 #include <cgnat/cgnat_session.h>
 #include <cgnat/cgnat_inlines.h>
+#include <cgnat/cgnat_sync.h>
 #include <vnet/ip/ip4_to_ip6.h>
 
 #define foreach_cgnat_in2out_error                                            \
@@ -124,6 +125,7 @@ cgnat_in2out_one (vlib_main_t *vm, vlib_node_runtime_t *node, cgnat_per_thread_t
   cgnat_mapping_t *m;
   cgnat_session_t *s;
   cgnat_sub_t *sub;
+  int created = 0;
   cgnat_map_t *map;
   u8 proto;
 
@@ -262,8 +264,13 @@ again:
 	}
       s = cgnat_session_create (t, thread_index, m, ip->dst_address.as_u32,
 				r_port, CGNAT_TO_TCP_TRANS, now, 0);
+      created = 1;
     }
-  cgnat_session_touch (t, s, cgnat_session_class (s, proto, b, 1), now);
+  {
+    u8 old_class = s->to_class;
+    cgnat_session_touch (t, s, cgnat_session_class (s, proto, b, 1), now);
+    cgnat_sync_touched (t, thread_index, s, old_class, created, now);
+  }
 
   cgnat_rewrite (ip, 1, m->out_addr.as_u32, m->out_port, proto, non_first);
   vnet_buffer (b)->sw_if_index[VLIB_TX] = m->out_fib_index;
