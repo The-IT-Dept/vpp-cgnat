@@ -13,10 +13,10 @@
 # doesn't stop the workers the way a CLI command does.  The gauge is set
 # while the cluster is enabled; a node without a cluster reads not-ready.
 #
-# Run it independently of VPP (not bound to vpp.service): it notices VPP
-# restarting (a new pid, whose startup config recreates the sessions
-# admin-down) and applies the state again, and it retries until every
-# set-flags succeeds.
+# Run it independently of VPP (not bound to vpp.service) with
+# Restart=always: when VPP restarts (a new pid, whose startup config
+# recreates the sessions admin-down) it exits and starts afresh.  It
+# retries until every set-flags succeeds.
 SOCK=${VPPCTL_SOCK:-/run/vpp/cli.sock}
 VPPCTL=${VPPCTL:-vppctl}
 STATS=${VPP_GET_STATS:-vpp_get_stats}
@@ -36,8 +36,10 @@ while true; do
      echo "$out" | grep -q "^1"; then
     want=up
   fi
-  now=$(pidof vpp)
-  [ "$now" != "$pid" ] && state=""  # a new VPP: its sessions start admin-down
+  now=$(pidof -s vpp)
+  # a new VPP incarnation (its sessions start admin-down): exit and let
+  # systemd start us afresh, rather than carry state across restarts
+  [ -n "$pid" ] && [ -n "$now" ] && [ "$now" != "$pid" ] && exit 0
   pid=$now
   if [ "$want" != "$state" ] && [ -n "$pid" ]; then
     ok=1
