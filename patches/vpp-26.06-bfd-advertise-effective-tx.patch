@@ -1,0 +1,24 @@
+diff --git a/src/vnet/bfd/bfd_main.c b/src/vnet/bfd/bfd_main.c
+index d71d9315b..d58efa3b4 100644
+--- a/src/vnet/bfd/bfd_main.c
++++ b/src/vnet/bfd/bfd_main.c
+@@ -905,7 +905,18 @@ bfd_init_control_frame (bfd_session_t *bs, vlib_buffer_t *b)
+   pkt->head.length = bfd_length;
+   pkt->my_disc = bs->local_discr;
+   pkt->your_disc = bs->remote_discr;
+-  pkt->des_min_tx = clib_host_to_net_u32 (bs->config_desired_min_tx_usec);
++  /* RFC 5880 6.8.3: advertise the rate we actually transmit at.  A new
++     value is advertised in a Poll and only becomes the transmit rate on the
++     Final; until then (and while not Up, when the effective value is held at
++     >= 1s) the peer must base its detection time on the effective value, or
++     a peer that trusts the advertised value (e.g. Junos) expires the session
++     every time it comes up. */
++  if (bs->poll_state == BFD_POLL_IN_PROGRESS ||
++      bs->poll_state == BFD_POLL_IN_PROGRESS_AND_QUEUED)
++    pkt->des_min_tx = clib_host_to_net_u32 (bs->config_desired_min_tx_usec);
++  else
++    pkt->des_min_tx = clib_host_to_net_u32 (
++      bfd_nsec_to_usec (bs->effective_desired_min_tx_nsec));
+   if (bs->echo)
+     {
+       pkt->req_min_rx =
