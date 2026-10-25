@@ -17,7 +17,7 @@ Metrics (all labelled by the scraping job with the node):
   vpp_cgnat_sync_{records_in,records_out,retransmits,overflow}_total{thread}
   vpp_cgnat_{sessions,mappings,subscribers}{thread}
   vpp_cgnat_cluster_{ready,peer_alive,fenced}
-  vpp_errors_total{node,reason}            cgnat-*, bond, bfd, ip4 drop paths
+  vpp_errors_total{vpp_node,reason}        cgnat-*, bond, bfd, ip4 drop paths
   vpp_vector_rate{thread}, vpp_buffers{pool,state}
 """
 import argparse
@@ -156,7 +156,7 @@ class Exporter:
                 total = sum(v) if isinstance(v, list) else v
             except Exception:
                 continue
-            out.append(f'vpp_errors_total{{node="{esc(m.group(1))}",reason="{esc(m.group(2))}"}} {total}')
+            out.append(f'vpp_errors_total{{vpp_node="{esc(m.group(1))}",reason="{esc(m.group(2))}"}} {total}')
 
         try:
             for th, r in enumerate(s["/sys/vector_rate_per_worker"][0]):
