@@ -206,6 +206,7 @@ The same settings are available via the CLI (`cgnat cluster …`, `cgnat cluster
 - **The pair link** carries HELLOs, steered packets and sync. Make it a dedicated, directly connected link: a VLAN between the two nodes.
 - **Extra paths** carry HELLOs only. Put them on other networks, such as each node's inside and outside links through the router, so that losing the pair link can be told apart from losing the peer.
 - A path is **alive** only in both directions: we hear the peer, and it says it hears us.
+- **Timers don't depend on VPP's per-thread clocks.** HELLOs and sync are received on whichever worker the NIC picks, and liveness is decided on the main thread. VPP 26.06's per-thread clocks drifted apart with uptime (workers 66 s and 71 s ahead of main on cgnat-1/2, which wedged BFD). So every time one thread stamps and another compares (path liveness, the duplicate-id hold, resync progress) is on `CLOCK_MONOTONIC`. Session timers stay on their worker's clock: that worker stamps, expires and looks up its own sessions. See [clock-skew.md](clock-skew.md).
 - A node takes over the peer's subscribers only when the peer is silent on every path.
 - If the pair link is down but the peer is alive on another path, the node with the **higher id fences**: it stops translating and reports not ready. When the link returns it resyncs, then serves again.
 

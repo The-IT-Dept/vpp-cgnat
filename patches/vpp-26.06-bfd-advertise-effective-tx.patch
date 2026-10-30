@@ -1,24 +1,759 @@
+VPP 26.06 BFD fixes. Applies on v26.06 after vpp-26.06-time-monotonic.patch
+(order in patches/series; apply with scripts/apply-patches.sh). Don't ship
+it without that patch, or a base that has master 7d65ef4b8 (see 2).
+
+1. Advertise the DesiredMinTx VPP transmits at (RFC 5880 6.8.3). VPP
+   advertised the configured 100 ms while still transmitting at the slow
+   rate. Junos trusts the advertised value, so it expired the session after
+   every Poll, about 10 flaps a minute. Frames now advertise the effective
+   value (>= 1 s in Down and AdminDown). While Up, a change is advertised
+   from the first frame of its Poll (the Poll starts before that frame is
+   built) and applied on the Final. A Final VPP sends while its own Poll is
+   pending carries the change and applies it (RFC 5880 6.5); 26.06 cleared
+   the Poll and never applied the change.
+
+2. Use one clock for every BFD timestamp. Control frames are consumed on
+   workers and timers run on main, and each stamped session times with its
+   own thread's vlib time. In 26.06 the per-thread clocks drift apart as
+   uptime grows (vppinfra 5c19169ae; vpp-26.06-time-monotonic.patch, the
+   backport of master 7d65ef4b8, removes the drift). A barrier never pulls
+   back a worker that is ahead of main. Once a worker led main by more than
+   the peer's transmit interval, every frame it received pushed
+   tx_timeout_nsec out of main's reach. VPP stopped transmitting and sat in
+   Init until it was restarted (cgnat-1/2 on 2026-10-27/28, with workers
+   66 s and 71 s ahead of main). BFD now reads CLOCK_MONOTONIC on every
+   thread, for session times and for its timing wheel, so it no longer
+   depends on the threads' vlib clocks agreeing. bfd-process still sleeps
+   on the main thread's vlib clock (vlib_process_wait_for_event_or_clock),
+   so a backward step in main's own vlib time would delay its wakeups by
+   the size of the step; the time-monotonic patch rules those out.
+
+3. "show bfd sessions" Last control frame ... ago subtracted nsec from CPU
+   cycles (fixed upstream by 2d01d5822). It now uses BFD's clock.
+
+4. Timer arithmetic. bfd_set_timer wrapped when the next event was already
+   due (a transmit that found no buffer, an echo timeout passed while a
+   worker consumed a frame) and put the session's timer ~48 days out; it
+   now fires on the next tick. bfd_process multiplied seconds by
+   SEC_PER_NSEC for its next wakeup; now NSEC_PER_SEC.
+
+Tests, test_bfd.py BFD4TestCase (single and multihop):
+test_des_min_tx_while_not_up fails on 26.06 (Down advertises 300000, not
+1000000); test_modify_des_min_tx_poll fails if the Poll's first frame
+advertises the old value; test_peer_poll_during_own_poll fails if a Final
+sent during VPP's own Poll leaves the change unapplied.
+BFDWorkerClockTestCase uses "test time worker-skew" in the unittest plugin
+to put the worker 5 s ahead of main. Both its tests fail without 2 and 3
+and pass with them, also on top of time-monotonic. "test time worker-skew
+<sec> hold" keeps the workers <sec> from main (<0: behind) across
+barriers, which pull a worker that is behind up to main; vpp-cgnat's
+test_cgnat.py and test_cgnat_cluster.py use both forms. On v26.06 +
+patches/series, make test-debug and make test (release) TEST=bfd:
+143 pass, 14 skip; TEST=test_time: 7 pass.
+
+diff --git a/src/plugins/unittest/time_test.c b/src/plugins/unittest/time_test.c
+index 0653391d2..e4aeb61dc 100644
+--- a/src/plugins/unittest/time_test.c
++++ b/src/plugins/unittest/time_test.c
+@@ -370,6 +370,149 @@ test_barrier_time_monotonicity (vlib_main_t *vm)
+   return error;
+ }
+ 
++/*
++ * Move every worker's clock away from the main thread's, from the worker
++ * itself, as per-thread clock drift does.  Used by test_bfd.py and by
++ * vpp-cgnat's tests.
++ *
++ * "worker-skew <sec>" adds <sec> to each worker's clock once.  The barrier
++ * keeps a worker that is ahead of main where it is (see
++ * vlib_worker_thread_barrier_check()), so a lead persists.
++ *
++ * "worker-skew <sec> hold" keeps each worker <sec> from main (negative:
++ * behind) until the next worker-skew command.  A barrier pulls a worker that
++ * is behind main up to main's clock, so the worker sets its clock again after
++ * every barrier, before its other nodes stamp anything: input nodes that
++ * poll come before interrupts and pending frames.  "worker-skew 0 hold" then
++ * "worker-skew 0" puts the workers back on main's clock.
++ */
++
++static f64 time_test_worker_skew;
++static u8 time_test_skew_hold;
++static u32 time_test_workers_skewed;
++/* per thread, held: the barrier release the skew was last set after, and the
++ * worker's vlib time and CLOCK_MONOTONIC just after it set it */
++static f64 *time_test_skew_release;
++static f64 *time_test_skew_vlib;
++static f64 *time_test_skew_mono;
++
++static f64
++time_test_monotonic_now (void)
++{
++  struct timespec ts;
++  clock_gettime (CLOCK_MONOTONIC, &ts);
++  return ts.tv_sec + ts.tv_nsec * 1e-9;
++}
++
++static uword
++time_test_skew_input_fn (vlib_main_t *vm, vlib_node_runtime_t *node, vlib_frame_t *frame)
++{
++  u32 ti = vm->thread_index;
++  f64 lead;
++
++  if (ti == 0)
++    return 0;
++
++  if (!time_test_skew_hold)
++    {
++      vlib_time_adjust (vm, time_test_worker_skew);
++      vlib_node_set_state (vm, node->node_index, VLIB_NODE_STATE_DISABLED);
++      clib_atomic_fetch_add (&time_test_workers_skewed, 1);
++      return 0;
++    }
++
++  /* held: once after each barrier.  The worker left it on main's clock, or
++   * where it was if it was ahead of main. */
++  if (vm->time_last_barrier_release == time_test_skew_release[ti])
++    return 0;
++  time_test_skew_release[ti] = vm->time_last_barrier_release;
++  lead = vm->time_last_barrier_release - vlib_get_first_main ()->time_last_barrier_release;
++  vlib_time_adjust (vm, time_test_worker_skew - lead);
++  time_test_skew_vlib[ti] = vlib_time_now (vm);
++  time_test_skew_mono[ti] = time_test_monotonic_now ();
++  clib_atomic_fetch_add (&time_test_workers_skewed, 1);
++  return 0;
++}
++
++VLIB_REGISTER_NODE (time_test_skew_input_node) = {
++  .function = time_test_skew_input_fn,
++  .type = VLIB_NODE_TYPE_INPUT,
++  .name = "time-test-skew-input",
++  .state = VLIB_NODE_STATE_DISABLED,
++};
++
++static clib_error_t *
++time_test_wait_skewed (vlib_main_t *vm, u32 n_workers)
++{
++  f64 deadline = vlib_time_now (vm) + 5.0;
++
++  while (clib_atomic_load_acq_n (&time_test_workers_skewed) < n_workers)
++    {
++      if (vlib_time_now (vm) > deadline)
++	return clib_error_return (0, "workers did not apply the skew");
++      vlib_process_suspend (vm, 1e-4);
++    }
++  return 0;
++}
++
++static clib_error_t *
++test_time_worker_skew (vlib_main_t *vm, f64 skew, int hold)
++{
++  u32 n_workers = vlib_get_n_threads () - 1;
++  clib_error_t *error;
++
++  if (!n_workers)
++    return clib_error_return (0, "worker-skew requires workers");
++  if (skew < 0 && !hold)
++    return clib_error_return (0, "a worker behind main catches up at the next "
++				 "barrier: use worker-skew <sec> hold");
++
++  vlib_worker_thread_barrier_sync (vm);
++  time_test_worker_skew = skew;
++  time_test_skew_hold = hold;
++  clib_atomic_store_rel_n (&time_test_workers_skewed, 0);
++  vec_validate (time_test_skew_release, n_workers);
++  vec_validate (time_test_skew_vlib, n_workers);
++  vec_validate (time_test_skew_mono, n_workers);
++  for (u32 i = 0; i <= n_workers; i++)
++    time_test_skew_release[i] = -1;
++  foreach_vlib_main ()
++    {
++      if (this_vlib_main->thread_index != 0)
++	vlib_node_set_state (this_vlib_main, time_test_skew_input_node.index,
++			     VLIB_NODE_STATE_POLLING);
++    }
++  vlib_worker_thread_barrier_release (vm);
++
++  if ((error = time_test_wait_skewed (vm, n_workers)))
++    return error;
++
++  /* a lead persists across a barrier; a held skew is set again after it */
++  clib_atomic_store_rel_n (&time_test_workers_skewed, 0);
++  vlib_worker_thread_barrier_sync (vm);
++  vlib_worker_thread_barrier_release (vm);
++  if (hold && (error = time_test_wait_skewed (vm, n_workers)))
++    return error;
++
++  /* The release returns once every worker has left the barrier and set its
++   * time_last_barrier_release.  Not foreach_vlib_main (): the barrier is
++   * released, and debug images assert that workers are parked in it. */
++  for (u32 i = 1; i <= n_workers; i++)
++    {
++      f64 lead;
++
++      if (hold)
++	/* the worker's clock now: its reading plus the time since */
++	lead = time_test_skew_vlib[i] + (time_test_monotonic_now () - time_test_skew_mono[i]) -
++	       vlib_time_now (vm);
++      else
++	lead =
++	  vlib_get_main_by_index (i)->time_last_barrier_release - vm->time_last_barrier_release;
++      vlib_cli_output (vm, "worker %u: %.3fs ahead of main%s", i, lead, hold ? " (held)" : "");
++    }
++  return 0;
++}
++
+ static clib_error_t *
+ test_time_command_fn (vlib_main_t *vm, unformat_input_t *input, vlib_cli_command_t *cmd)
+ {
+@@ -382,10 +525,15 @@ test_time_command_fn (vlib_main_t *vm, unformat_input_t *input, vlib_cli_command
+   int test_virtual_offset = 0;
+   int test_barrier = 0;
+   int test_all = 0;
++  f64 skew;
+ 
+   while (unformat_check_input (input) != UNFORMAT_END_OF_INPUT)
+     {
+-      if (unformat (input, "monotonicity"))
++      if (unformat (input, "worker-skew %f hold", &skew))
++	return test_time_worker_skew (vm, skew, 1 /* hold */);
++      else if (unformat (input, "worker-skew %f", &skew))
++	return test_time_worker_skew (vm, skew, 0);
++      else if (unformat (input, "monotonicity"))
+ 	test_monotonicity = 1;
+       else if (unformat (input, "discontinuity"))
+ 	test_discontinuity = 1;
+@@ -471,7 +619,7 @@ test_time_command_fn (vlib_main_t *vm, unformat_input_t *input, vlib_cli_command
+ VLIB_CLI_COMMAND (test_time_command, static) = {
+   .path = "test time",
+   .short_help = "test time [monotonicity | discontinuity | small-discontinuity | accumulated-error "
+-		"| wall-step | virtual-offset | barrier | all]",
++		"| wall-step | virtual-offset | barrier | all | worker-skew <sec> [hold]]",
+   .function = test_time_command_fn,
+   .is_mp_safe = 1,
+ };
+diff --git a/src/vnet/bfd/bfd_cli.c b/src/vnet/bfd/bfd_cli.c
+index 3c2ac34f0..150bfff4c 100644
+--- a/src/vnet/bfd/bfd_cli.c
++++ b/src/vnet/bfd/bfd_cli.c
+@@ -45,7 +45,7 @@
+ static u8 *
+ format_bfd_session_cli (u8 * s, va_list * args)
+ {
+-  vlib_main_t *vm = va_arg (*args, vlib_main_t *);
++  CLIB_UNUSED (vlib_main_t * vm) = va_arg (*args, vlib_main_t *);
+   bfd_session_t *bs = va_arg (*args, bfd_session_t *);
+   s = format (s, "%10s %-32s %20s\n", "", "Hop Type",
+ 	      bfd_hop_type_string (bs->hop_type));
+@@ -83,19 +83,18 @@ format_bfd_session_cli (u8 * s, va_list * args)
+   s =
+     format (s, "%10s %-32s %20u\n", "", "Transmit interval",
+ 	    bfd_nsec_to_usec (bs->transmit_interval_nsec));
+-  u64 now = clib_cpu_time_now ();
++  /* the session timestamps are nsec on BFD's clock, not CPU clocks */
++  u64 now = bfd_clock_now_nsec ();
+   u8 *tmp = NULL;
+   if (bs->last_tx_nsec > 0)
+     {
+-      tmp = format (tmp, "%.2fs ago", (now - bs->last_tx_nsec) *
+-		    vm->clib_time.seconds_per_clock);
++      tmp = format (tmp, "%.2fs ago", (i64) (now - bs->last_tx_nsec) * SEC_PER_NSEC);
+       s = format (s, "%10s %-32s %20v\n", "", "Last control frame tx", tmp);
+       vec_reset_length (tmp);
+     }
+   if (bs->last_rx_nsec)
+     {
+-      tmp = format (tmp, "%.2fs ago", (now - bs->last_rx_nsec) *
+-		    vm->clib_time.seconds_per_clock);
++      tmp = format (tmp, "%.2fs ago", (i64) (now - bs->last_rx_nsec) * SEC_PER_NSEC);
+       s = format (s, "%10s %-32s %20v\n", "", "Last control frame rx", tmp);
+       vec_reset_length (tmp);
+     }
+@@ -107,15 +106,11 @@ format_bfd_session_cli (u8 * s, va_list * args)
+       s =
+ 	format (s, "%10s %-32s %20u\n", "", "Echo transmit interval",
+ 		bfd_nsec_to_usec (bs->echo_transmit_interval_nsec));
+-      tmp =
+-	format (tmp, "%.2fs ago",
+-		(now -
+-		 bs->echo_last_tx_nsec) * vm->clib_time.seconds_per_clock);
++      tmp = format (tmp, "%.2fs ago", (i64) (now - bs->echo_last_tx_nsec) * SEC_PER_NSEC);
+       s = format (s, "%10s %-32s %20v\n", "", "Last echo frame tx", tmp);
+       vec_reset_length (tmp);
+-      tmp = format (tmp, "%.6fs",
+-		    (bs->echo_last_rx_nsec - bs->echo_last_tx_nsec) *
+-		    vm->clib_time.seconds_per_clock);
++      tmp =
++	format (tmp, "%.6fs", (i64) (bs->echo_last_rx_nsec - bs->echo_last_tx_nsec) * SEC_PER_NSEC);
+       s =
+ 	format (s, "%10s %-32s %20v\n", "", "Last echo frame roundtrip time",
+ 		tmp);
 diff --git a/src/vnet/bfd/bfd_main.c b/src/vnet/bfd/bfd_main.c
-index d71d9315b..d58efa3b4 100644
+index d71d9315b..6de88ffe7 100644
 --- a/src/vnet/bfd/bfd_main.c
 +++ b/src/vnet/bfd/bfd_main.c
-@@ -905,7 +905,18 @@ bfd_init_control_frame (bfd_session_t *bs, vlib_buffer_t *b)
+@@ -72,13 +72,15 @@ bfd_nsec_to_usec (u64 nsec)
+   return nsec / NSEC_PER_USEC;
+ }
+ 
++/* BFD's clock (see bfd_clock_now_nsec), not this thread's vlib time;
++ * *now_sec is the same time in seconds, for the timing wheel */
+ always_inline u64
+-bfd_time_now_nsec (vlib_main_t * vm, f64 * vm_time)
++bfd_time_now_nsec (CLIB_UNUSED (vlib_main_t *vm), f64 *now_sec)
+ {
+-  f64 _vm_time = vlib_time_now (vm);
+-  if (vm_time)
+-    *vm_time = _vm_time;
+-  return _vm_time * NSEC_PER_SEC;
++  u64 now = bfd_clock_now_nsec ();
++  if (now_sec)
++    *now_sec = now * SEC_PER_NSEC;
++  return now;
+ }
+ 
+ static vlib_node_registration_t bfd_process_node;
+@@ -333,14 +335,16 @@ bfd_set_timer (bfd_main_t * bm, bfd_session_t * bs, u64 now,
+     {
+       int send_signal = 0;
+       bs->event_time_nsec = next;
++      /* next can be in the past (a transmit that found no buffer, an echo
++	 timeout passed while a worker consumed a frame): then fire on the
++	 next tick, not ~48 days on after the u64 wrapped */
++      u64 in_nsec = next > now ? next - now : 0;
+       /* add extra tick if it's not even */
+-      u32 wheel_time_ticks =
+-	(bs->event_time_nsec - now) / bm->nsec_per_tw_tick +
+-	((bs->event_time_nsec - now) % bm->nsec_per_tw_tick != 0);
++      u64 ticks = in_nsec / bm->nsec_per_tw_tick + (in_nsec % bm->nsec_per_tw_tick != 0);
++      u32 wheel_time_ticks = clib_min (ticks, (u64) UINT32_MAX);
+       BFD_DBG ("event_time_nsec %lu (%lu nsec/%.3fs in future) -> "
+-	       "wheel_time_ticks %u", bs->event_time_nsec,
+-	       bs->event_time_nsec - now,
+-	       (bs->event_time_nsec - now) * SEC_PER_NSEC, wheel_time_ticks);
++	       "wheel_time_ticks %u",
++	       bs->event_time_nsec, in_nsec, in_nsec * SEC_PER_NSEC, wheel_time_ticks);
+       wheel_time_ticks = wheel_time_ticks ? wheel_time_ticks : 1;
+       bfd_lock (bm);
+       if (bs->tw_id)
+@@ -905,7 +909,18 @@ bfd_init_control_frame (bfd_session_t *bs, vlib_buffer_t *b)
    pkt->head.length = bfd_length;
    pkt->my_disc = bs->local_discr;
    pkt->your_disc = bs->remote_discr;
 -  pkt->des_min_tx = clib_host_to_net_u32 (bs->config_desired_min_tx_usec);
-+  /* RFC 5880 6.8.3: advertise the rate we actually transmit at.  A new
-+     value is advertised in a Poll and only becomes the transmit rate on the
-+     Final; until then (and while not Up, when the effective value is held at
-+     >= 1s) the peer must base its detection time on the effective value, or
-+     a peer that trusts the advertised value (e.g. Junos) expires the session
-+     every time it comes up. */
-+  if (bs->poll_state == BFD_POLL_IN_PROGRESS ||
-+      bs->poll_state == BFD_POLL_IN_PROGRESS_AND_QUEUED)
++  /* RFC 5880 6.8.3: advertise the interval we actually transmit at.  While
++     Up, a change is advertised from the first frame of its Poll (the caller
++     moves poll_state to IN_PROGRESS before building that frame) and becomes
++     the transmit interval on the Final.  Otherwise the peer must base its
++     detection time on the effective value, which Down and AdminDown hold at
++     >= 1 s: a peer that trusts the advertised value (e.g. Junos) expired the
++     session every time it came up. */
++  if (BFD_STATE_up == bs->local_state &&
++      (BFD_POLL_IN_PROGRESS == bs->poll_state || BFD_POLL_IN_PROGRESS_AND_QUEUED == bs->poll_state))
 +    pkt->des_min_tx = clib_host_to_net_u32 (bs->config_desired_min_tx_usec);
 +  else
-+    pkt->des_min_tx = clib_host_to_net_u32 (
-+      bfd_nsec_to_usec (bs->effective_desired_min_tx_nsec));
++    pkt->des_min_tx = clib_host_to_net_u32 (bfd_nsec_to_usec (bs->effective_desired_min_tx_nsec));
    if (bs->echo)
      {
        pkt->req_min_rx =
+@@ -1040,8 +1055,10 @@ bfd_send_periodic (vlib_main_t *vm, vlib_node_runtime_t *rt, bfd_main_t *bm,
+ 	  return;
+ 	}
+       vlib_buffer_t *b = vlib_get_buffer (vm, bi);
++      int poll = 0;
+       ASSERT (b->current_data == 0);
+-      bfd_init_control_frame (bs, b);
++      /* start a Poll before building the frame: its first frame advertises
++	 the new values too (bfd_init_control_frame) */
+       switch (bs->poll_state)
+ 	{
+ 	case BFD_POLL_NEEDED:
+@@ -1058,13 +1075,18 @@ bfd_send_periodic (vlib_main_t *vm, vlib_node_runtime_t *rt, bfd_main_t *bm,
+ 	  /* fallthrough */
+ 	case BFD_POLL_IN_PROGRESS:
+ 	case BFD_POLL_IN_PROGRESS_AND_QUEUED:
+-	  bfd_pkt_set_poll (vlib_buffer_get_current (b));
+-	  BFD_DBG ("Setting poll bit in packet, bs_idx=%u", bs->bs_idx);
++	  poll = 1;
+ 	  break;
+ 	case BFD_POLL_NOT_NEEDED:
+ 	  /* fallthrough */
+ 	  break;
+ 	}
++      bfd_init_control_frame (bs, b);
++      if (poll)
++	{
++	  bfd_pkt_set_poll (vlib_buffer_get_current (b));
++	  BFD_DBG ("Setting poll bit in packet, bs_idx=%u", bs->bs_idx);
++	}
+       bfd_add_auth_section (vm, b, bs);
+       bfd_process_trace_buf (vm, rt, b, bs);
+       bfd_add_transport_layer (vm, bi, bs);
+@@ -1087,18 +1109,39 @@ void
+ bfd_init_final_control_frame (vlib_main_t *vm, vlib_buffer_t *b,
+ 			      bfd_session_t *bs)
+ {
++  bfd_main_t *bm = &bfd_main;
++  u64 now = bfd_time_now_nsec (vm, NULL);
++  int applied = 0;
+   BFD_DBG ("Send final control frame for bs_idx=%lu", bs->bs_idx);
++  /*
++   * RFC 5880 6.5 allows a Final to carry our own pending changes, so this
++   * Final ends any Poll of ours: while Up the changes take effect now, as on
++   * a Final for our Poll (bfd_consume_pkt), and the Final advertises them.
++   * Otherwise the move to Up applies them.
++   */
++  if (BFD_POLL_NOT_NEEDED != bs->poll_state)
++    {
++      bfd_set_poll_state (bs, BFD_POLL_NOT_NEEDED);
++      if (BFD_STATE_up == bs->local_state)
++	{
++	  bfd_set_effective_desired_min_tx (bm, bs, now, bs->config_desired_min_tx_nsec);
++	  bfd_set_effective_required_min_rx (
++	    bs, clib_max (bs->echo * bm->min_required_min_rx_while_echo_nsec,
++			  bs->config_required_min_rx_nsec));
++	  applied = 1;
++	}
++    }
+   bfd_init_control_frame (bs, b);
+   bfd_pkt_set_final (vlib_buffer_get_current (b));
+   bfd_add_auth_section (vm, b, bs);
+   u32 bi = vlib_get_buffer_index (vm, b);
+   bfd_add_transport_layer (vm, bi, bs);
+-  bs->last_tx_nsec = bfd_time_now_nsec (vm, NULL);
+-  /*
+-   * RFC allows to include changes in final frame, so if there were any
+-   * pending, we already did that, thus we can clear any pending poll needs
+-   */
+-  bfd_set_poll_state (bs, BFD_POLL_NOT_NEEDED);
++  bs->last_tx_nsec = now;
++  if (applied)
++    {
++      bfd_calc_next_tx (bm, bs, now);
++      bfd_set_timer (bm, bs, now, 0);
++    }
+ }
+ 
+ static void
+@@ -1211,10 +1254,9 @@ bfd_process (vlib_main_t *vm, vlib_node_runtime_t *rt,
+ 
+   while (1)
+     {
+-      f64 vm_time;
+-      u64 now = bfd_time_now_nsec (vm, &vm_time);
+-      BFD_DBG ("wakeup, now is %llunsec, vlib_time_now() is %.9f", now,
+-	       vm_time);
++      f64 now_sec;
++      u64 now = bfd_time_now_nsec (vm, &now_sec);
++      BFD_DBG ("wakeup, now is %llunsec, %.9fs", now, now_sec);
+       bfd_lock (bm);
+       f64 timeout;
+       if (pool_elts (bm->sessions))
+@@ -1226,10 +1268,10 @@ bfd_process (vlib_main_t *vm, vlib_node_runtime_t *rt,
+ 	      BFD_DBG
+ 		("tw_timer_first_expires_in_ticks(%p) returns 0ticks",
+ 		 &bm->wheel);
+-	      timeout = bm->wheel.next_run_time - vm_time;
++	      timeout = bm->wheel.next_run_time - now_sec;
+ 	      BFD_DBG ("wheel.next_run_time is %.9f",
+ 		       bm->wheel.next_run_time);
+-	      u64 next_expire_nsec = now + timeout * SEC_PER_NSEC;
++	      u64 next_expire_nsec = now + (timeout > 0 ? timeout * NSEC_PER_SEC : 0);
+ 	      bm->bfd_process_next_wakeup_nsec = next_expire_nsec;
+ 	      bfd_unlock (bm);
+ 	    }
+@@ -1255,7 +1297,7 @@ bfd_process (vlib_main_t *vm, vlib_node_runtime_t *rt,
+ 	  (void) vlib_process_wait_for_event (vm);
+ 	}
+       event_type = vlib_process_get_events (vm, &event_data);
+-      now = bfd_time_now_nsec (vm, &vm_time);
++      now = bfd_time_now_nsec (vm, &now_sec);
+       uword *session_index;
+       switch (event_type)
+ 	{
+@@ -1313,10 +1355,9 @@ bfd_process (vlib_main_t *vm, vlib_node_runtime_t *rt,
+ 	  vlib_log_err (bm->log_class, "BUG: event type 0x%wx", event_type);
+ 	  break;
+ 	}
+-      BFD_DBG ("tw_timer_expire_timers_vec(%p, %.04f);", &bm->wheel, vm_time);
++      BFD_DBG ("tw_timer_expire_timers_vec(%p, %.04f);", &bm->wheel, now_sec);
+       bfd_lock (bm);
+-      expired =
+-	TW (tw_timer_expire_timers_vec) (&bm->wheel, vm_time, expired);
++      expired = TW (tw_timer_expire_timers_vec) (&bm->wheel, now_sec, expired);
+       BFD_DBG ("Expired %d elements", vec_len (expired));
+       u32 *p = NULL;
+       vec_foreach (p, expired)
+diff --git a/src/vnet/bfd/bfd_main.h b/src/vnet/bfd/bfd_main.h
+index c603a721e..c31dfd2a1 100644
+--- a/src/vnet/bfd/bfd_main.h
++++ b/src/vnet/bfd/bfd_main.h
+@@ -458,6 +458,25 @@ const char *bfd_hop_type_string (bfd_hop_type_e state);
+ #define NSEC_PER_SEC (NSEC_PER_USEC * USEC_PER_SEC)
+ #define SEC_PER_NSEC ((f64)1/NSEC_PER_SEC)
+ 
++/**
++ * BFD's clock in nsec, the same on every thread.
++ *
++ * Control frames are consumed on the thread that receives them, usually a
++ * worker, while the timers run on the main thread, so session timestamps are
++ * written by one thread and compared by another.  vlib time is per thread and
++ * the threads can disagree by seconds: a worker that runs ahead of main is not
++ * pulled back at a barrier.  Once a worker was further ahead than the peer's
++ * transmit interval, every frame received pushed the next transmit time out of
++ * main's reach and periodic transmission stopped for good.
++ */
++always_inline u64
++bfd_clock_now_nsec (void)
++{
++  struct timespec ts;
++  clock_gettime (CLOCK_MONOTONIC, &ts);
++  return (u64) ts.tv_sec * NSEC_PER_SEC + ts.tv_nsec;
++}
++
+ /** timing wheel tick-rate, 1ms should be good enough */
+ #define BFD_TW_TPS (MSEC_PER_SEC)
+ 
+diff --git a/test/test_bfd.py b/test/test_bfd.py
+index 7be08777c..9dd4e8b69 100644
+--- a/test/test_bfd.py
++++ b/test/test_bfd.py
+@@ -7,6 +7,7 @@ import binascii
+ from collections import namedtuple
+ import hashlib
+ import ipaddress
++import re
+ import reprlib
+ import time
+ import unittest
+@@ -1523,6 +1524,132 @@ class BFD4TestCase(VppTestCase):
+         # poll bit must not be set
+         self.assertNotIn("P", p.sprintf("%BFD.flags%"), "Poll bit set in BFD packet")
+ 
++    def wait_for_bfd_packet_keeping_up(self, timeout, pcap_time_min=None):
++        """The next BFD packet from vpp, sending Up frames every 0.1 s
++        meanwhile, so the session stays up however slowly vpp transmits"""
++        deadline = time.time() + timeout
++        while True:
++            self.test_session.send_packet()
++            try:
++                return wait_for_bfd_packet(self, 0.1, pcap_time_min=pcap_time_min)
++            except CaptureTimeoutError:
++                if time.time() > deadline:
++                    raise
++
++    def wait_for_poll(self, pcap_time_min, des_min_tx_before):
++        """The first frame of vpp's poll sequence.  Frames before it still
++        advertise des_min_tx_before."""
++        for dummy in range(10):
++            p = wait_for_bfd_packet(self, pcap_time_min=pcap_time_min)
++            self.test_session.send_packet()
++            if "P" in p.sprintf("%BFD.flags%"):
++                return p
++            self.assert_equal(
++                p[BFD].desired_min_tx_interval,
++                des_min_tx_before,
++                "BFD desired min tx interval before the poll",
++            )
++        self.fail("vpp did not start a poll sequence")
++
++    def test_modify_des_min_tx_poll(self):
++        """modify desired min tx - the poll's first frame advertises it"""
++        bfd_session_up(self)
++        old = self.vpp_session.desired_min_tx
++        p = wait_for_bfd_packet(self)
++        self.test_session.send_packet()
++        self.assert_equal(
++            p[BFD].desired_min_tx_interval, old, "BFD desired min tx interval"
++        )
++        mark = time.time() - self.vpp_clock_offset
++        self.vpp_session.modify_parameters(desired_min_tx=10 * old)
++        new = self.vpp_session.desired_min_tx
++        p = self.wait_for_poll(mark, old)
++        # RFC 5880 6.8.3: the poll tells the peer the new interval before vpp
++        # transmits at it, so the peer's detection time allows for it
++        self.assert_equal(
++            p[BFD].desired_min_tx_interval,
++            new,
++            "BFD desired min tx interval in the poll's first frame",
++        )
++        final = self.test_session.create_packet()
++        final[BFD].flags = "F"
++        self.test_session.send_packet(final)
++        mark = time.time() - self.vpp_clock_offset
++        p = self.wait_for_bfd_packet_keeping_up(4, pcap_time_min=mark)
++        self.assertNotIn("P", p.sprintf("%BFD.flags%"), "Poll bit set after the final")
++        self.assert_equal(
++            p[BFD].desired_min_tx_interval,
++            new,
++            "BFD desired min tx interval after the poll",
++        )
++        self.assert_equal(len(self.vapi.collect_events()), 0, "number of bfd events")
++
++    def test_des_min_tx_while_not_up(self):
++        """advertise the >= 1 s desired min tx used while down and admin-down"""
++        # RFC 5880 6.8.3: at least 1 s while not up; vpp advertises what it uses
++        slow = max(USEC_IN_SEC, self.vpp_session.desired_min_tx)
++        p = wait_for_bfd_packet(self, 2)
++        self.assert_equal(p[BFD].state, BFDState.down, BFDState)
++        self.assert_equal(
++            p[BFD].desired_min_tx_interval,
++            slow,
++            "BFD desired min tx interval while down",
++        )
++        bfd_session_up(self)
++        p = wait_for_bfd_packet(self)
++        self.assert_equal(
++            p[BFD].desired_min_tx_interval,
++            self.vpp_session.desired_min_tx,
++            "BFD desired min tx interval while up",
++        )
++        self.vpp_session.admin_down()
++        e = self.vapi.wait_for_event(1, "bfd_udp_session_event")
++        verify_event(self, e, expected_state=BFDState.admin_down)
++        p = wait_for_bfd_packet(
++            self, 2, pcap_time_min=time.time() - self.vpp_clock_offset
++        )
++        self.assert_equal(p[BFD].state, BFDState.admin_down, BFDState)
++        self.assert_equal(
++            p[BFD].desired_min_tx_interval,
++            slow,
++            "BFD desired min tx interval while admin-down",
++        )
++
++    def test_peer_poll_during_own_poll(self):
++        """peer polls during vpp's poll - the final carries and applies the change"""
++        bfd_session_up(self)
++        old = self.vpp_session.desired_min_tx
++        wait_for_bfd_packet(self)
++        self.test_session.send_packet()
++        mark = time.time() - self.vpp_clock_offset
++        self.vpp_session.modify_parameters(desired_min_tx=10 * old)
++        new = self.vpp_session.desired_min_tx
++        self.wait_for_poll(mark, old)
++        # the peer polls instead of answering vpp's poll
++        poll = self.test_session.create_packet()
++        poll[BFD].flags = "P"
++        mark = time.time() - self.vpp_clock_offset
++        self.test_session.send_packet(poll)
++        for dummy in range(5):
++            p = wait_for_bfd_packet(self, pcap_time_min=mark)
++            if "F" in p.sprintf("%BFD.flags%"):
++                break
++        else:
++            self.fail("vpp did not answer the poll with a final")
++        self.assertNotIn("P", p.sprintf("%BFD.flags%"), "Poll bit set in the final")
++        # RFC 5880 6.5: the final may carry vpp's own change; it then applies
++        self.assert_equal(
++            p[BFD].desired_min_tx_interval, new, "BFD desired min tx interval in the final"
++        )
++        p = self.wait_for_bfd_packet_keeping_up(4)
++        self.assertNotIn("P", p.sprintf("%BFD.flags%"), "Poll bit set after the final")
++        self.assert_equal(
++            p[BFD].desired_min_tx_interval,
++            new,
++            "BFD desired min tx interval after the final",
++        )
++        self.assert_equal(len(self.vapi.collect_events()), 0, "number of bfd events")
++
+     # returning inconsistent results requiring retries in per-patch tests
+     @unittest.skipUnless(config.extended, "part of extended tests")
+     def test_poll_response(self):
+@@ -2123,6 +2250,98 @@ class BFD4TestCase(VppTestCase):
+                 self.sleep(0.2, "brief pause between TOS tests")
+ 
+ 
++@tag_run_solo
++class BFDWorkerClockTestCase(VppTestCase):
++    """BFD with a worker clock ahead of the main thread's"""
++
++    vpp_worker_count = 1
++    pg0 = None
++    vpp_clock_offset = None
++    vpp_session = None
++    test_session = None
++
++    @classmethod
++    def setUpClass(cls):
++        super(BFDWorkerClockTestCase, cls).setUpClass()
++        try:
++            cls.create_pg_interfaces([0])
++            cls.pg0.config_ip4()
++            cls.pg0.configure_ipv4_neighbors()
++            cls.pg0.admin_up()
++            cls.pg0.resolve_arp()
++        except Exception:
++            super(BFDWorkerClockTestCase, cls).tearDownClass()
++            raise
++
++    @classmethod
++    def tearDownClass(cls):
++        super(BFDWorkerClockTestCase, cls).tearDownClass()
++
++    def setUp(self):
++        super(BFDWorkerClockTestCase, self).setUp()
++        self.vapi.want_bfd_events()
++        self.pg0.enable_capture()
++        try:
++            self.vpp_session = VppBFDUDPSession(self, self.pg0, self.pg0.remote_ip4)
++            self.vpp_session.add_vpp_config()
++            self.vpp_session.admin_up()
++            self.test_session = BFDTestSession(self, self.pg0, AF_INET)
++        except BaseException:
++            self.vapi.want_bfd_events(enable_disable=0)
++            raise
++
++    def tearDown(self):
++        if not self.vpp_dead:
++            self.vapi.want_bfd_events(enable_disable=0)
++        self.vapi.collect_events()  # clear the event queue
++        super(BFDWorkerClockTestCase, self).tearDown()
++
++    def move_worker_clock_ahead(self, seconds):
++        """Put the worker's clock ahead of main's, as long-running VPP 26.06
++        did (vlib_worker_thread_barrier_check() never pulls it back)."""
++        # control frames are received on the worker, timers run on main
++        rx_on_worker = bfd_grab_stats_snapshot(self, thread_index=1).rx
++        self.assertGreater(rx_on_worker, 0, "control frames received on worker")
++        self.vapi.cli("test time worker-skew %s" % seconds)
++        clock = self.vapi.cli("show clock")
++        error = re.search(r"Thread 1 offset \S+ error (\S+)", clock)
++        self.assertIsNotNone(error, clock)
++        # error is main's minus the worker's time at the last barrier release
++        self.assertLess(float(error.group(1)), -(seconds - 1), clock)
++
++    def keep_peer_up(self, duration, interval):
++        """Send Up control frames from the peer for duration seconds"""
++        deadline = time.time() + duration
++        while time.time() < deadline:
++            self.test_session.send_packet()
++            self.sleep(interval, "peer transmit interval")
++
++    def test_periodic_tx_with_worker_clock_ahead(self):
++        """periodic control frames with a worker clock ahead of main's"""
++        bfd_session_up(self)
++        self.move_worker_clock_ahead(5)
++        before = bfd_grab_stats_snapshot(self)
++        # the peer transmits more often than the worker's lead
++        self.keep_peer_up(3, 0.1)
++        diff = bfd_stats_diff(before, bfd_grab_stats_snapshot(self))
++        # vpp's transmit interval is 225-300 ms, ~10-13 frames in 3 s
++        self.assertGreaterEqual(diff.tx, 5, "control frames sent by vpp in 3 s")
++        self.assert_equal(self.vpp_session.state, BFDState.up, BFDState)
++
++    def test_show_last_frame_age(self):
++        """show bfd sessions reports the age of the last control frames"""
++        bfd_session_up(self)
++        self.move_worker_clock_ahead(5)
++        self.keep_peer_up(1, 0.1)
++        out = self.vapi.cli("show bfd sessions")
++        ages = re.findall(r"Last control frame (tx|rx)\s+(\S+)s ago", out)
++        self.assert_equal(len(ages), 2, "last control frame tx/rx lines")
++        for direction, age in ages:
++            self.assert_in_range(
++                float(age), 0, 1, "last control frame %s age" % direction
++            )
++
++
+ @parameterized_class(
+     [
+         {"multihop": False},

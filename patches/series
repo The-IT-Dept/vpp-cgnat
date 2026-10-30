@@ -1,0 +1,20 @@
+# VPP patches for vpp-cgnat, in the order scripts/apply-patches.sh applies
+# them to a pristine v26.06 checkout (git apply --index, no fuzz, no 3-way).
+# Every patches/*.patch must be listed here, once.
+
+# DPDK: "vlan-strip-offload on" device option, for SR-IOV VFs whose VLAN the
+# host enforces
+vpp-26.06-dpdk-vlan-strip.patch
+
+# vppinfra: keep per-thread time monotonic while tracking the wall clock.
+# Backport of master 7d65ef4b8 (same diff as stable/2606 8f426ed54 and
+# stable/2610 ab5beac21, in v26.10); drop it on a base that has it.
+vpp-26.06-time-monotonic.patch
+
+# BFD: advertise the DesiredMinTx actually used (a change from its Poll's
+# first frame), one clock (CLOCK_MONOTONIC) for BFD on every thread, "show bfd
+# sessions" frame ages, timer arithmetic, and the "test time worker-skew <sec>
+# [hold]" helper for test_bfd.py and this repo's tests.  Needs the
+# time-monotonic patch: its time_test.c hunks are against it, and bfd-process
+# still sleeps on the main thread's vlib clock.
+vpp-26.06-bfd-advertise-effective-tx.patch

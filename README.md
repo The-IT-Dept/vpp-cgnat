@@ -5,7 +5,7 @@ A carrier-grade NAT plugin for [VPP](https://fd.io), built around
 commodity servers.
 
 > **Status:** the single node (Phase 1) and the active/active pair (Phase 2) are
-> done, tested in VPP's `make test` (174 tests) and in a two-VPP lab with real
+> done, tested in VPP's `make test` (184 tests) and in a two-VPP lab with real
 > TCP/UDP flows and kill/restore, and running in production in front of an ISP
 > core router on SR-IOV VFs: about 2.0 Mpps lossless and 2.9 Mpps peak on two
 > worker cores. See
@@ -147,22 +147,38 @@ are in `bench/`.
 
 ## Building and testing
 
-The plugin builds in-tree in a VPP 26.06 checkout. Out-of-tree packaging
-comes later.
+The plugin builds in-tree in a VPP 26.06 checkout, with three VPP patches.
+Out-of-tree packaging comes later.
 
 ```
 git clone https://github.com/FDio/vpp ~/vpp && cd ~/vpp && git checkout v26.06
-make install-dep && make build
+~/vpp-cgnat/scripts/apply-patches.sh ~/vpp  # patches/series, in order
+make install-dep
 ~/vpp-cgnat/scripts/link-into-vpp.sh        # symlinks src/plugins/cgnat into ~/vpp
-cd ~/vpp && make build                      # or make build-release
+~/vpp-cgnat/scripts/check-patches.sh ~/vpp  # v26.06 + patches/series exactly?
+cd ~/vpp && make build                      # or make build-release, make pkg-deb
 ~/vpp-cgnat/scripts/test.sh test_cgnat      # VPP make test with this repo's tests
 ```
 
-The test suites run in VPP's own framework: `test/test_cgnat.py` (79 tests,
-the single node with 0 and 2 workers) and `test/test_cgnat_cluster.py` (94
-tests, the pair against a scapy-emulated peer). VPP needs
-`patches/vpp-26.06-dpdk-vlan-strip.patch` only for SR-IOV VFs with
-host-enforced VLANs. `scripts/remote.sh` syncs to
+The patches, in `patches/series` order:
+
+| patch | why |
+|---|---|
+| `vpp-26.06-dpdk-vlan-strip.patch` | a `vlan-strip-offload on` device option. SR-IOV VFs with a host-enforced VLAN hand frames up still tagged, and VPP drops them ([sriov.md](docs/sriov.md#what-vpp-needs)) |
+| `vpp-26.06-time-monotonic.patch` | backport of master 7d65ef4b8. 26.06's per-thread clocks drift apart with uptime, which wedged BFD on both nodes ([clock-skew.md](docs/clock-skew.md)). Drop it on a base that has it |
+| `vpp-26.06-bfd-advertise-effective-tx.patch` | BFD advertises the DesiredMinTx it transmits at (Junos flapped the sessions otherwise), times on one clock on every thread, and has `test time worker-skew` for the tests. Needs the time patch |
+
+`apply-patches.sh` wants a clean v26.06, applies with `git apply --index` (no
+fuzz) and leaves the tree untouched if any patch fails. `check-patches.sh`
+fails unless the tracked files are exactly v26.06 + `patches/series`, and
+prints the tree hash. Run it before building anything that ships;
+`scripts/remote.sh` runs it before every build.
+
+The test suites run in VPP's own framework: `test/test_cgnat.py` (84 tests,
+the single node with 0, 1 and 2 workers) and `test/test_cgnat_cluster.py`
+(100 tests, the pair against a scapy-emulated peer). Both include tests with
+the worker's clock 5 s ahead of or behind main's. VPP's own `TEST=bfd` and
+`TEST=test_time` cover the BFD and time patches. `scripts/remote.sh` syncs to
 a build VM, rebuilds and runs a test from a workstation.
 
 ## Roadmap

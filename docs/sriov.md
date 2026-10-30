@@ -58,7 +58,7 @@ SR-IOV removes the host from the data path.
   }
   ```
 
-  It must be on each `dev` line. It doesn't apply from `dev default`.
+  It must be on each `dev` line. It doesn't apply from `dev default`. `scripts/apply-patches.sh` applies it with the other two VPP patches (time and BFD; see the [README](../README.md#building-and-testing)).
 - **VF link state can't be forced** on ixgbe. A VF's link follows its port. A VF whose port has no carrier is down, and its bond carries on with the other member.
 
 ## Failover lessons from VFs
