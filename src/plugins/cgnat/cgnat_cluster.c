@@ -7,7 +7,8 @@
  * Pair membership: configuration, HELLOs on every path, liveness, the
  * config hash, and the ready / serving decision.  A process on the main
  * thread does all of the evaluation each hello interval; the input node
- * only records what it hears.
+ * only records what it hears, on whichever thread receives it, so every
+ * time here is on cgnat_clock_now() (see cgnat.h).
  */
 
 #include <vnet/fib/fib_table.h>
@@ -249,7 +250,8 @@ cgnat_next_hops_up (void)
   return !down;
 }
 
-/* evaluate liveness and readiness; runs on main each hello interval */
+/* evaluate liveness and readiness; runs on main each hello interval.  now
+   is cgnat_clock_now(): the input node stamps on the receiving thread */
 static void
 cgnat_cluster_evaluate (vlib_main_t *vm, f64 now)
 {
@@ -471,7 +473,7 @@ cgnat_cluster_process (vlib_main_t *vm, vlib_node_runtime_t *rt,
       vlib_process_get_events (vm, 0);
       if (!cl->enabled)
 	continue;
-      cgnat_cluster_evaluate (vm, vlib_time_now (vm));
+      cgnat_cluster_evaluate (vm, cgnat_clock_now ());
       cgnat_cluster_send_hellos (vm);
     }
   return 0;
@@ -569,7 +571,7 @@ cgnat_cluster_set (int enable, u8 node_id, ip4_address_t *local,
   cl->peer_alive = cl->pair_alive = cl->ready = cl->fenced = 0;
   cl->serving = 0;
   cl->reason = CGNAT_REASON_STARTING;
-  cl->enabled_at = vlib_time_now (vm);
+  cl->enabled_at = cgnat_clock_now ();
   cl->config_hash = cgnat_config_hash ();
   udp_register_dst_port (vm, cl->port, cgnat_cluster_input_node.index, 1);
   cl->enabled = 1;

@@ -189,7 +189,6 @@ vl_api_cgnat_session_dump_t_handler (vl_api_cgnat_session_dump_t *mp)
   cgnat_main_t *cm = &cgnat_main;
   vl_api_cgnat_session_details_t *rmp;
   vl_api_registration_t *reg;
-  f64 now = vlib_time_now (vlib_get_main ());
   cgnat_per_thread_t *t;
   ip4_address_t in;
   u32 fib_index = ~0;
@@ -208,10 +207,13 @@ vl_api_cgnat_session_dump_t_handler (vl_api_cgnat_session_dump_t *mp)
   vec_foreach (t, cm->per_thread)
     {
       cgnat_session_t *s;
+      f64 now;
 
       if (!mp->all &&
 	  !cgnat_sub_get (t, t - cm->per_thread, fib_index, &in, 0))
 	continue;
+      /* session times are on their owner thread's clock */
+      now = cgnat_thread_now (t - cm->per_thread);
       pool_foreach (s, t->sessions_pool)
 	{
 	  cgnat_mapping_t *m = pool_elt_at_index (t->mappings, s->mapping_index);

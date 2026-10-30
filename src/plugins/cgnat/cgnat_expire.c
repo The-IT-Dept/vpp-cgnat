@@ -12,6 +12,11 @@
  * drains over the next loops without stalling forwarding.  Lookups treat
  * expired-but-unwalked sessions as gone, so the walker's pace never
  * changes behaviour, only memory.
+ *
+ * Session times are on the owner thread's vlib clock, which is all the walk
+ * and the lookups compare them with.  Each run also publishes the thread's
+ * vlib time against the plugin clock, so that the API and CLI on main can
+ * show a session's real idle time (cgnat_thread_now).
  */
 
 #include <vlib/vlib.h>
@@ -31,6 +36,7 @@ VLIB_NODE_FN (cgnat_expire_walk_node)
   u32 n = 0;
   int c, more = 0;
 
+  t->vlib_minus_clock = now - cgnat_clock_now ();
   for (c = 0; c < CGNAT_N_TO; c++)
     {
       u32 head = t->lru_head[c];

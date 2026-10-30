@@ -376,7 +376,8 @@ VLIB_NODE_FN (cgnat_sync_worker_node)
   u32 ti = vm->thread_index;
   cgnat_per_thread_t *t = vec_elt_at_index (cm->per_thread, ti);
   u32 *from = vlib_frame_vector_args (frame), n = frame->n_vectors, i;
-  f64 now = vlib_time_now (vm);
+  f64 now = vlib_time_now (vm); /* session times: this thread's clock */
+  f64 rx_at = 0; /* resync progress: main reads it, so the plugin clock */
 
   for (i = 0; i < n; i++)
     {
@@ -430,7 +431,9 @@ VLIB_NODE_FN (cgnat_sync_worker_node)
 	      if (!in_order)
 		continue;
 	      rx->expected++;
-	      cgnat_main.cluster.last_sync_rx = now;
+	      if (!rx_at)
+		rx_at = cgnat_clock_now ();
+	      cgnat_main.cluster.last_sync_rx = rx_at;
 	    }
 	  for (k = 0; k < nr; k++)
 	    {
@@ -586,9 +589,10 @@ VLIB_NODE_FN (cgnat_sync_flush_node)
 
       /* give up if the peer dies mid-walk.  The request itself shows it
 	 was there: right after it comes back our liveness may not have
-	 caught up yet, and dropping that walk stalls its join */
+	 caught up yet, and dropping that walk stalls its join.  (The thread
+	 that received the request stamped its start on the plugin clock) */
       if ((!cl->peer_alive || !cl->pair_alive) &&
-	  now - cl->resync_walk_started > cl->dead_interval)
+	  cgnat_clock_now () - cl->resync_walk_started > cl->dead_interval)
 	t->resync_active = 0;
       while (t->resync_active && t->resync_cursor < end &&
 	     n < CGNAT_RESYNC_SLICE)

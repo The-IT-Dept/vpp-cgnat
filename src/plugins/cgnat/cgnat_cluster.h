@@ -17,7 +17,7 @@ typedef struct
   ip4_address_t peer;
   u32 table_id;
   u32 fib_index;
-  f64 last_rx;
+  f64 last_rx; /* cgnat_clock_now(), stamped on the receiving thread */
   u32 heard_epoch; /* what the peer last said it heard from us */
   u8 min_ttl;	   /* 255 on the pair link; probe paths may cross a router */
   u8 alive;
@@ -55,7 +55,7 @@ typedef struct
   /* this incarnation */
   u32 epoch;
   u32 config_hash;
-  f64 enabled_at;
+  f64 enabled_at; /* cgnat_clock_now(), like every time in this struct */
 
   /* last heard from the peer (written by the input node, any thread) */
   volatile u8 peer_node_id;

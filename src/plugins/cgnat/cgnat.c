@@ -253,6 +253,15 @@ cgnat_main_loop_enter (vlib_main_t *vm)
   cm->fq_sync_index =
     vlib_frame_queue_main_init (cgnat_sync_worker_node.index, 0);
 
+  /* until each thread's first expiry tick: the threads start on main's
+     clock */
+  {
+    cgnat_per_thread_t *t;
+    f64 d = vlib_time_now (vm) - cgnat_clock_now ();
+    vec_foreach (t, cm->per_thread)
+      t->vlib_minus_clock = d;
+  }
+
   /* cluster from startup.conf */
   {
     typeof (cm->cluster.startup) *c = &cm->cluster.startup;

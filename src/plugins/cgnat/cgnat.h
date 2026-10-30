@@ -6,6 +6,7 @@
 #ifndef included_cgnat_h
 #define included_cgnat_h
 
+#include <time.h>
 #include <vlib/vlib.h>
 #include <vnet/vnet.h>
 #include <vnet/ip/ip.h>
@@ -151,6 +152,11 @@ typedef struct
   u32 resync_walk_gen; /* last walk started */
   u32 resync_cursor;   /* next session pool index */
   u8 resync_active;
+
+  /* this thread's vlib time minus cgnat_clock_now(), written by this thread
+     each expiry tick: other threads read this thread's session times
+     through it (cgnat_thread_now) */
+  f64 vlib_minus_clock;
 } cgnat_per_thread_t;
 
 typedef struct
@@ -202,6 +208,43 @@ typedef struct
 } cgnat_main_t;
 
 extern cgnat_main_t cgnat_main;
+
+/*
+ * Clocks.  vlib time is per thread, and VPP's threads can disagree by
+ * seconds: in 26.06 workers ran ahead of main as uptime grew (66 s and 71 s
+ * on cgnat-1/2 in 2026-10, which wedged BFD), a barrier never pulls a worker
+ * that is ahead back, and one that is behind only catches up at the next
+ * barrier.  So:
+ *
+ *  - A time one thread stamps and another compares (HELLO liveness, the
+ *    duplicate-id hold, resync progress and the resync walk) is on
+ *    cgnat_clock_now(), CLOCK_MONOTONIC, the same on every thread.  It costs
+ *    a vDSO call: control-plane events only, never per data packet.
+ *  - Session times stay on the owner thread's vlib clock: the owner stamps,
+ *    expires and looks them up, and nothing else compares them.  Another
+ *    thread that shows them (API, CLI) gets the owner's clock from
+ *    cgnat_thread_now().
+ */
+static_always_inline f64
+cgnat_clock_now (void)
+{
+  struct timespec ts;
+
+  clock_gettime (CLOCK_MONOTONIC, &ts);
+  return ts.tv_sec + ts.tv_nsec * 1e-9;
+}
+
+/* thread ti's vlib time, now, from any thread: accurate to the owner's clock
+   changes since its last expiry tick (0.1 s) */
+static_always_inline f64
+cgnat_thread_now (u32 ti)
+{
+  if (ti == vlib_get_thread_index ())
+    return vlib_time_now (vlib_get_main ());
+  return cgnat_clock_now () +
+	 vec_elt_at_index (cgnat_main.per_thread, ti)->vlib_minus_clock;
+}
+
 extern vlib_node_registration_t cgnat_in2out_node;
 extern vlib_node_registration_t cgnat_out2in_node;
 extern vlib_node_registration_t cgnat_hairpin_node;

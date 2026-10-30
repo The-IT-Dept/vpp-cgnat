@@ -57,7 +57,6 @@ cgnat_cluster_hello (vlib_main_t *vm, cgnat_cluster_t *cl, ip4_header_t *ip,
 {
   cgnat_msg_hello_t *hb = (cgnat_msg_hello_t *) (h + 1);
   cgnat_path_t *p;
-  f64 now = vlib_time_now (vm);
   u16 nw, fw;
 
   if (len < sizeof (*h) + sizeof (*hb))
@@ -71,9 +70,10 @@ cgnat_cluster_hello (vlib_main_t *vm, cgnat_cluster_t *cl, ip4_header_t *ip,
   if (p->peer.as_u32 != ip->src_address.as_u32 ||
       p->local.as_u32 != ip->dst_address.as_u32 || ip->ttl < p->min_ttl)
     return CGNAT_CLUSTER_INPUT_ERROR_BAD_SOURCE;
+  /* main compares these stamps: on the plugin clock, not this thread's */
   if (h->node_id == cl->node_id)
     {
-      cl->dup_last = now;
+      cl->dup_last = cgnat_clock_now ();
       return CGNAT_CLUSTER_INPUT_ERROR_DUPLICATE;
     }
   nw = clib_net_to_host_u16 (hb->n_workers);
@@ -88,7 +88,7 @@ cgnat_cluster_hello (vlib_main_t *vm, cgnat_cluster_t *cl, ip4_header_t *ip,
   cl->peer_n_workers = nw;
   cl->peer_first_worker = fw;
   p->heard_epoch = clib_net_to_host_u32 (hb->heard_epoch);
-  p->last_rx = now;
+  p->last_rx = cgnat_clock_now ();
   return CGNAT_CLUSTER_INPUT_ERROR_HELLO;
 }
 
@@ -163,7 +163,7 @@ VLIB_NODE_FN (cgnat_cluster_input_node)
 	     repeat from the same peer incarnation while a walk is running
 	     doesn't restart it (it would never finish on a big table) */
 	  u32 epoch = clib_net_to_host_u32 (h->epoch);
-	  f64 now = vlib_time_now (vm);
+	  f64 now = cgnat_clock_now (); /* every thread reads the start */
 	  cl->want_resync_peer = 0;
 	  if (epoch != cl->resync_walk_epoch ||
 	      now - cl->resync_walk_started > 30.0)

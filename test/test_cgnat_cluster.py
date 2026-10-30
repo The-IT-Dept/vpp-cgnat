@@ -4,6 +4,7 @@
 
 import ipaddress
 import os
+import re
 import struct
 import time
 import unittest
@@ -1086,6 +1087,144 @@ class TestCgnatClusterFailoverWorkers(TestCgnatClusterFailover):
     """Cluster resync/failover/failback with 2 workers"""
 
     vpp_worker_count = 2
+
+
+class TestCgnatClusterWorkerClock(CgnatOwnerCase):
+    """Cluster liveness and resync with a worker clock ahead of / behind main's
+
+    HELLOs and SYNCs are received on the worker; liveness and the resync
+    timer are evaluated on main.  VPP 26.06's per-thread clocks drifted apart
+    with uptime (workers 66 s and 71 s ahead on cgnat-1/2), and a barrier
+    never pulls a worker that is ahead back.
+    """
+
+    vpp_worker_count = 1
+    dead_ms = 500  # the default
+
+    def tearDown(self):
+        if not self.vpp_dead:
+            # back on main's clock, and stop holding the worker
+            self.vapi.cli("test time worker-skew 0 hold")
+            self.vapi.cli("test time worker-skew 0")
+        super().tearDown()
+
+    def skew_worker(self, seconds, hold=False):
+        """Put the worker's clock `seconds` ahead of main's (behind if negative,
+        which needs hold: a barrier pulls a worker that is behind up to main)"""
+        out = self.vapi.cli("test time worker-skew %s%s" % (seconds, " hold" if hold else ""))
+        lead = re.search(r"worker 1: (\S+)s ahead of main", out)
+        self.assertIsNotNone(lead, out)
+        self.assertAlmostEqual(float(lead.group(1)), seconds, delta=0.5, msg=out)
+
+    def on_worker(self, counter):
+        return self.statistics[counter][1]
+
+    def test_dead_peer_detected_with_worker_ahead(self):
+        """Worker 5 s ahead: a silent peer is dead within dead-interval, we take over"""
+        self.skew_worker(5)
+        before = self.on_worker("/err/cgnat-cluster-input/hello")
+        self.keep_hello(0.6)
+        # (64 owner lookups take well under the 0.5 s dead interval)
+        self.assertEqual(set(self.owners(64)), {1, 2})
+        self.keep_hello(0.6)
+        self.assertGreater(self.on_worker("/err/cgnat-cluster-input/hello") - before, 0,
+                           "HELLOs received on the worker")
+        self.assertTrue(self.status().peer_alive)
+        self.send_peer(self.hello())
+        silent = time.time()
+        self.wait_for(lambda: not self.status().peer_alive, timeout=10, step=0.02)
+        took = time.time() - silent
+        self.logger.info("worker-clock: peer dead %.2fs after its last HELLO" % took)
+        self.assertFalse(self.status().peer_alive, "peer still alive after %.2fs" % took)
+        # the dead interval, then the next 0.1 s evaluation
+        self.assertLess(took, self.dead_ms / 1000 + 0.6, "peer dead after %.2fs" % took)
+        st = self.status()
+        self.assertEqual((st.ready, st.reason), (True, "alone"))
+        self.assertEqual(self.owners(64), {1: 64})
+
+    def test_live_peer_stays_alive_with_worker_behind(self):
+        """Worker 5 s behind: a peer saying hello stays alive, no false failover"""
+        self.skew_worker(-5, hold=True)
+        before = self.on_worker("/err/cgnat-cluster-input/hello")
+        self.keep_hello(0.5)
+        alive = []
+        end = time.time() + 2.0
+        while time.time() < end:
+            self.send_peer(self.hello())
+            alive.append(self.status().peer_alive)
+            self.sleep(0.1)
+        self.assertGreater(self.on_worker("/err/cgnat-cluster-input/hello") - before, 0,
+                           "HELLOs received on the worker")
+        self.logger.info("worker-clock: peer alive samples %s" % alive)
+        self.assertTrue(all(alive), "peer alive samples: %s" % alive)
+        self.assertEqual(set(self.owners(64)), {1, 2})
+
+    def test_stalled_resync_rerequested_with_worker_ahead(self):
+        """Worker 5 s ahead: a stalled resync is asked for again 3 s after the last SYNC"""
+        self.skew_worker(5)
+        self.pg2.enable_capture()
+        self.cluster_on(dead_interval_ms=self.dead_ms)  # rejoin: pull the peer's table
+        self.keep_hello(1.0, state=READY)
+        self.assertEqual(self.status().reason, "resyncing")
+        self.assertTrue(self.capture_msgs(self.pg2, RESYNC_REQ))
+        # some of the peer's table, to our worker; then the transfer stalls
+        h = self.host(0)
+        f = self.vapi.cgnat_forward(in_vrf=0, in_addr=h)
+        rec = record(1, h, 7000, str(f.out_addr), f.port_lo, self.pg1.remote_ip4, 53)
+        before = self.on_worker("/err/cgnat-sync-worker/records")
+        self.pg2.enable_capture()
+        self.send_peer(self.msg(SYNC, SYNC_BODY.pack(0, 1, 1, 0, 0) + rec))
+        self.keep_hello(2.0, state=READY)
+        self.assertEqual(self.on_worker("/err/cgnat-sync-worker/records") - before, 1,
+                         "records applied on the worker")
+        self.assertEqual(self.capture_msgs(self.pg2, RESYNC_REQ), [],
+                         "asked again while the transfer was making progress")
+        self.pg2.enable_capture()
+        self.keep_hello(2.0, state=READY)
+        self.assertEqual(self.status().reason, "resyncing")
+        reqs = self.capture_msgs(self.pg2, RESYNC_REQ)
+        self.logger.info("worker-clock: %d RESYNC_REQ 2-4 s after the SYNC" % len(reqs))
+        self.assertTrue(reqs, "stalled resync not asked for again within 4 s")
+
+    def test_duplicate_id_clears_with_worker_ahead(self):
+        """Worker 5 s ahead: duplicate-node-id clears a dead interval after the last duplicate"""
+        self.skew_worker(5)
+        before = self.on_worker("/err/cgnat-cluster-input/duplicate-node-id")
+        self.keep_hello(0.8, node_id=1)
+        self.assertGreater(self.on_worker("/err/cgnat-cluster-input/duplicate-node-id") - before,
+                           0, "duplicate HELLOs received on the worker")
+        st = self.status()
+        self.assertEqual((st.ready, st.reason), (False, "duplicate-node-id"))
+        silent = time.time()
+        self.wait_for(lambda: self.status().reason != "duplicate-node-id", timeout=10, step=0.02)
+        took = time.time() - silent
+        self.logger.info("worker-clock: duplicate-node-id cleared %.2fs after the last one" % took)
+        st = self.status()
+        self.assertEqual((st.ready, st.reason), (True, "alone"), "after %.2fs" % took)
+        # the dead interval, then the next 0.1 s evaluation
+        self.assertLess(took, self.dead_ms / 1000 + 0.6, "duplicate-node-id for %.2fs" % took)
+
+    def test_duplicate_id_refused_with_worker_behind(self):
+        """Worker 5 s behind: a peer using our node id is still refused"""
+        self.skew_worker(-5, hold=True)
+        before = self.on_worker("/err/cgnat-cluster-input/duplicate-node-id")
+        self.keep_hello(0.8, node_id=1)
+        self.assertGreater(self.on_worker("/err/cgnat-cluster-input/duplicate-node-id") - before,
+                           0, "duplicate HELLOs received on the worker")
+        st = self.status()
+        self.assertFalse(st.peer_alive)
+        self.assertEqual((st.ready, st.reason), (False, "duplicate-node-id"))
+
+    def test_show_hello_age_with_worker_ahead(self):
+        """Worker 5 s ahead: show cgnat cluster gives the age of the last HELLO"""
+        self.skew_worker(5)
+        self.keep_hello(0.5)
+        out = self.vapi.cli("show cgnat cluster")
+        age = re.search(r"path 0 .*: alive \((\S+)s ago\)", out)
+        self.assertIsNotNone(age, out)
+        self.logger.info("worker-clock: path 0 HELLO %ss ago" % age.group(1))
+        self.assertGreaterEqual(float(age.group(1)), 0, out)
+        self.assertLess(float(age.group(1)), self.dead_ms / 1000, out)
 
 
 class TestCgnatClusterStartup(VppTestCase):

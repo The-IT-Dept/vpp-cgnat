@@ -3,6 +3,8 @@
 """vpp-cgnat plugin tests (run with VPP make test, see scripts/test.sh)."""
 
 import ipaddress
+import re
+import time
 import unittest
 
 from scapy.layers.inet import ICMP, IP, TCP, UDP, IPerror, IPOption_RR, UDPerror, fragment
@@ -901,6 +903,100 @@ class TestCgnatOpsWorkers(TestCgnatOps):
     """CGNAT operations with 2 workers"""
 
     vpp_worker_count = 2
+
+
+def skew_worker(test, seconds, hold=False):
+    """Put worker 1's clock `seconds` ahead of main's (behind if negative, which
+    needs hold: a barrier pulls a worker that is behind up to main), as VPP
+    26.06's per-thread clocks drifted.  The unittest plugin's helper; see
+    patches/vpp-26.06-bfd-advertise-effective-tx.patch."""
+    out = test.vapi.cli("test time worker-skew %s%s" % (seconds, " hold" if hold else ""))
+    lead = re.search(r"worker 1: (\S+)s ahead of main", out)
+    test.assertIsNotNone(lead, out)
+    test.assertAlmostEqual(float(lead.group(1)), seconds, delta=0.5, msg=out)
+
+
+def unskew_worker(test):
+    """Put the workers back on main's clock, and stop holding them"""
+    test.vapi.cli("test time worker-skew 0 hold")
+    test.vapi.cli("test time worker-skew 0")
+
+
+class TestCgnatWorkerClock(CgnatPgCase):
+    """CGNAT sessions with a worker clock ahead of / behind main's
+
+    Sessions live on their owner worker and are stamped and expired with its
+    clock; the API and CLI read them on main.
+    """
+
+    vpp_worker_count = 1
+
+    def tearDown(self):
+        if not self.vpp_dead:
+            unskew_worker(self)
+            self.vapi.cgnat_set_timeouts(
+                tcp_established=7440, tcp_transitory=240, udp=300, icmp=60
+            )
+        super().tearDown()
+
+    def one_session(self):
+        """A UDP session on worker 1, and when it was created"""
+        before = self.statistics["/cgnat/sessions"][1][0]
+        self.in2out(self.host(), 5000, self.pg1.remote_ip4, 53)
+        created = time.time()
+        self.assertEqual(self.statistics["/cgnat/sessions"][1][0] - before, 1,
+                         "session on worker 1")
+        return created
+
+    def check_idle(self, skew, hold=False):
+        skew_worker(self, skew, hold)
+        created = self.one_session()
+        self.sleep(1.0)
+        ss = list(self.vapi.cgnat_session_dump(all=1))
+        age = time.time() - created
+        self.assertEqual(len(ss), 1)
+        self.logger.info("worker-clock: dump idle %.3fs after %.3fs" % (ss[0].idle, age))
+        self.assertEqual(ss[0].thread_index, 1)
+        self.assertTrue(age - 0.5 <= ss[0].idle <= age + 0.1,
+                        "session dump idle %.3fs, idle for %.3fs" % (ss[0].idle, age))
+        out = self.vapi.cli("show cgnat sessions")
+        idle = re.search(r" idle (-?\d+)s ", out)
+        self.logger.info("worker-clock: %s" % out.strip())
+        self.assertIsNotNone(idle, out)
+        self.assertIn(int(idle.group(1)), (1, 2), out)
+
+    def check_expiry(self, skew, hold=False):
+        skew_worker(self, skew, hold)
+        self.vapi.cgnat_set_timeouts(
+            tcp_established=7440, tcp_transitory=240, udp=2, icmp=60
+        )
+        created = self.one_session()
+        self.sleep(1.5)
+        self.assertEqual(self.vapi.cgnat_get_status().sessions, 1, "expired early")
+        end = created + 6
+        while self.vapi.cgnat_get_status().sessions and time.time() < end:
+            self.sleep(0.05)
+        took = time.time() - created
+        self.logger.info("worker-clock: session gone %.2fs after creation" % took)
+        self.assertEqual(self.vapi.cgnat_get_status().sessions, 0, "not expired")
+        # timeout 2 s, then the next 0.1 s expiry tick
+        self.assertLess(took, 2.0 + 0.6, "expired after %.2fs" % took)
+
+    def test_session_idle_with_worker_ahead(self):
+        """Worker 5 s ahead: session dump and CLI report the real idle time"""
+        self.check_idle(5)
+
+    def test_session_idle_with_worker_behind(self):
+        """Worker 5 s behind: session dump and CLI report the real idle time"""
+        self.check_idle(-5, hold=True)
+
+    def test_session_expiry_with_worker_ahead(self):
+        """Worker 5 s ahead: an idle session expires on time, not early or late"""
+        self.check_expiry(5)
+
+    def test_session_expiry_with_worker_behind(self):
+        """Worker 5 s behind: an idle session expires on time, not early or late"""
+        self.check_expiry(-5, hold=True)
 
 
 if __name__ == "__main__":

@@ -176,7 +176,6 @@ show_cgnat_sessions_fn (vlib_main_t *vm, unformat_input_t *input,
 			vlib_cli_command_t *cmd)
 {
   cgnat_main_t *cm = &cgnat_main;
-  f64 now = vlib_time_now (vm);
   cgnat_per_thread_t *t;
   ip4_address_t sub = {};
   u32 vrf = 0, fib_index = ~0;
@@ -193,6 +192,8 @@ show_cgnat_sessions_fn (vlib_main_t *vm, unformat_input_t *input,
 
   vec_foreach (t, cm->per_thread)
     {
+      /* session times are on their owner thread's clock */
+      f64 now = cgnat_thread_now (t - cm->per_thread);
       cgnat_session_t *s;
 
       pool_foreach (s, t->sessions_pool)
@@ -475,7 +476,7 @@ show_cgnat_cluster_fn (vlib_main_t *vm, unformat_input_t *input,
 		       vlib_cli_command_t *cmd)
 {
   cgnat_cluster_t *cl = &cgnat_main.cluster;
-  f64 now = vlib_time_now (vm);
+  f64 now = cgnat_clock_now (); /* HELLOs are stamped on the plugin clock */
   cgnat_path_t *p;
 
   if (!cl->enabled)
